@@ -411,19 +411,22 @@ def test_a_very_old_cursor_is_clamped_to_the_lookback_window(aws):
     # receberia zero eventos e um cursor que nunca avanca — travado para sempre.
     _, logs = aws
 
-    call({"events": "10", "since": "0"})
-
-    requested = logs.calls[0]["startTime"]
+    # O piso e medido ANTES da chamada. Medi-lo depois compara com um "agora"
+    # posterior ao que o handler usou, e a asercao falha por alguns
+    # milissegundos de diferenca — um teste que passa ou nao conforme a maquina
+    # esteja rapida.
     floor = now_ms() - status.MAX_EVENTS_LOOKBACK_MS
 
-    assert requested >= floor
+    call({"events": "10", "since": "0"})
+
+    assert logs.calls[0]["startTime"] >= floor
 
 
 def test_the_cursor_never_comes_back_below_the_window(aws):
     # Sem isto, o cliente reenviaria o mesmo cursor antigo para sempre.
-    _, body = call({"events": "10", "since": "0"})
-
     floor = now_ms() - status.MAX_EVENTS_LOOKBACK_MS
+
+    _, body = call({"events": "10", "since": "0"})
 
     assert body["events_cursor"] >= floor
 

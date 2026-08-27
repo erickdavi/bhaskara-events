@@ -87,6 +87,35 @@ manipulação do CSSOM por script.
 Revalidado depois da correção: **zero erros no console** e a página funcional —
 150 mensagens com 20% inválidas, `122 + 28 = 150 — concluído`.
 
+### 4. Dois testes instáveis, encontrados pelo clone limpo
+
+O `pytest` no clone recém-baixado falhou onde passava localmente:
+
+```text
+FAILED tests/test_status_handler.py::test_the_cursor_never_comes_back_below_the_window
+1 failed, 144 passed
+```
+
+Os dois testes da janela de busca (introduzidos no Ciclo 6) mediam o piso
+**depois** da chamada:
+
+```python
+call({"events": "10", "since": "0"})
+floor = now_ms() - status.MAX_EVENTS_LOOKBACK_MS   # "agora" posterior ao do handler
+assert body["events_cursor"] >= floor              # falha por milissegundos
+```
+
+O handler calcula o piso com o seu próprio `now_ms`, capturado antes. Qualquer
+milissegundo decorrido entre os dois torna o piso do teste maior que o do
+handler, e a asserção quebra. Localmente passava por sorte; no clone, a primeira
+execução (criando o venv) foi lenta o bastante para expor a corrida.
+
+Corrigido medindo o piso **antes** da chamada. Confirmado com 30 execuções
+seguidas, zero falhas.
+
+É exatamente o tipo de defeito que só o teste de clone limpo encontra — e a
+razão de esse teste existir.
+
 ## Reprodutibilidade
 
 O README foi reescrito do zero como guia de reprodução:
@@ -119,7 +148,7 @@ CloudWatch Logs, não defeitos. O painel trata as duas explicitamente.
 | --- | --- | --- |
 | 1 | Terraform sem variável órfã, sem `Resource: "*"` | ✅ |
 | 2 | IAM revisado e documentado | ✅ matriz das três roles no README |
-| 3 | Testes passando | ✅ `145 passed` |
+| 3 | Testes passando, sem instabilidade | ✅ `145 passed`, 30 execuções seguidas sem falha |
 | 4 | README permite reprodução de clone limpo | ✅ ver abaixo |
 | 5 | `.gitignore` correto, lock versionado | ✅ |
 | 6 | Segurança revisada | ✅ CSP, HSTS, CORS, IAM, bucket privado |
