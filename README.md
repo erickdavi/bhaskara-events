@@ -12,19 +12,58 @@ de forma assíncrona; um painel web mostra tudo acontecendo.
 ```bash
 git clone git@github.com:erickdavi/bhaskara-events.git
 cd bhaskara-events
-./run.sh                                            # 145 testes, sem AWS
+./run.sh demo                                       # simula o fluxo, sem AWS
+./run.sh                                            # 152 testes, sem AWS
 cd infra && terraform init && terraform apply       # ~5 min
 terraform output -raw dashboard_url                 # abra no browser
 terraform output -raw api_key                       # cole no painel
 ```
 
+## A função event-driven não tem URL
+
+O worker — a função que **processa** as equações — é acionada exclusivamente por
+mensagem publicada na fila `orders`. Ela não tem Function URL, não está atrás do
+API Gateway e não aceita invocação HTTP de ninguém. É a mudança em relação ao
+Checkpoint 1, onde a função respondia a `GET /bhaskara`.
+
+Algo precisa **publicar** no tópico, e é aí que entram os outros dois
+componentes:
+
+| Componente | É acionado por | Tem URL pública? |
+| --- | --- | --- |
+| **worker** | mensagem na fila `orders` | **não** |
+| producer | `POST /orders` | sim, protegida por chave |
+| status | `GET /status` | sim, protegida por chave |
+| painel | browser | sim, arquivos estáticos |
+
+Os dois endpoints existem para **alimentar e observar** a fila, não para
+processar equações. Ambos exigem `x-api-key`, comparada com
+`hmac.compare_digest`, com falha fechada e throttling de 5 rps — sem a chave, a
+resposta é `403` e **nenhuma mensagem é gerada**. O painel é estático, servido de
+um bucket S3 **privado** via CloudFront com Origin Access Control, e a chave não
+está no bundle.
+
+Se você quer ver só o núcleo event-driven, sem nenhum HTTP no caminho:
+
+```bash
+aws sqs send-message \
+  --queue-url "$(terraform -chdir=infra output -raw orders_queue_url)" \
+  --message-body '{"a":1,"b":-5,"c":6}'
+
+aws logs tail "$(terraform -chdir=infra output -raw worker_log_group)" --since 2m
+```
+
+A mensagem é publicada direto na fila e o worker a processa — o mesmo caminho
+que o producer usa, sem passar por nenhuma URL.
+
 ## Índice
 
+- [A função event-driven não tem URL](#a-função-event-driven-não-tem-url)
 - [Arquitetura](#arquitetura)
+- [Como rodar localmente](#como-rodar-localmente)
 - [Como funciona](#como-funciona)
 - [Estrutura do projeto](#estrutura-do-projeto)
 - [Pré-requisitos](#pré-requisitos)
-- [Executando os testes](#executando-os-testes)
 - [Implantando na AWS](#implantando-na-aws)
 - [Usando o painel](#usando-o-painel)
 - [A API](#a-api)
@@ -111,7 +150,8 @@ caminhos.
 ```text
 bhaskara-events/
 ├── conftest.py                    # sys.path dos testes = sys.path da Lambda
-├── run.sh                         # bootstrap do venv + testes
+├── local_simulator.py             # roda o fluxo inteiro sem AWS
+├── run.sh                         # testes e simulação local
 ├── requirements.txt
 ├── src/
 │   ├── shared/                    # o que mais de um handler usa
@@ -123,7 +163,7 @@ bhaskara-events/
 │       │   ├── handler.py         # recebe POST /orders, publica em lotes
 │       │   └── generator.py       # constrói as equações
 │       └── status/handler.py      # responde GET /status
-├── tests/                         # 145 casos, nenhum toca a AWS
+├── tests/                         # 152 casos, nenhum toca a AWS
 ├── infra/                         # Terraform
 │   ├── versions.tf  main.tf  variables.tf  outputs.tf
 │   ├── sqs.tf                     # orders, results, DLQ
@@ -182,26 +222,105 @@ exercitem os mesmos imports que rodam na nuvem.
 As permissões necessárias na conta: IAM, Lambda, SQS, API Gateway, CloudWatch
 Logs, S3 e CloudFront.
 
-## Executando os testes
+## Como rodar localmente
 
-**Não precisa de credenciais AWS** — nenhum teste toca a nuvem. Os clientes SQS
-e CloudWatch são substituídos por dublês, via fixture `autouse`, para que um
-teste que esquecesse a fixture não publicasse na fila de verdade.
+**Não precisa de credenciais AWS, nem de conta na nuvem.** Nada sai da sua
+máquina.
+
+### Pré-requisitos
+
+- Python 3.9 ou superior
+- Terminal aberto
+
+### Passo a passo
+
+1. Clone o repositório:
+
+   ```bash
+   git clone https://github.com/erickdavi/bhaskara-events.git
+   ```
+
+2. Entre na pasta do projeto:
+
+   ```bash
+   cd bhaskara-events
+   ```
+
+3. Rode a simulação do fluxo event-driven:
+
+   ```bash
+   ./run.sh demo
+   ```
+
+4. Rode os testes:
+
+   ```bash
+   ./run.sh
+   ```
+
+### O que a simulação faz
+
+`./run.sh demo` executa o fluxo inteiro em memória, com o **mesmo código que
+roda na nuvem**: o gerador do producer cria as equações, e o handler do worker
+as recebe em lotes de 10 no formato exato que o event source mapping da SQS
+entrega. Só o transporte é substituído — as filas viram listas em memória e o
+cliente SQS vira um dublê.
+
+```text
+Producer
+  gerando 200 equações (10% inválidas)
+  publicadas na fila orders: 200 mensagens
+
+Worker
+  consumindo em 20 lotes de até 10 mensagens
+  concluído
+
+Resultado
+  publicadas na fila results                186
+  recusadas, enviadas à DLQ                  14
+  devolvidas para retry                       0
+  ---------------------------------------------
+  total                                     200
+
+Amostra dos resultados
+  -3x² + 21x + 132 = 0         →  x₁=-4  x₂=11
+  -1x² - 13x - 60 = 0          →  sem raízes reais
+  5x² + 5x - 150 = 0           →  x₁=5  x₂=-6
+
+Amostra das recusas (na nuvem iriam à DLQ com o motivo anexado)
+  {"a": 0, "b": -7, "c": -7}     →  O valor de 'a' não pode ser zero.
+  {"a": "1", "b": -5, "c": 6}    →  O coeficiente 'a' deve ser um numero, e nao str.
+  {isto nao e json               →  Corpo da mensagem nao e JSON valido: ...
+```
+
+Aceita parâmetros:
+
+```bash
+./run.sh demo 1000 25            # 1000 equações, 25% inválidas
+./run.sh demo 50 0 --seed 7      # carga reproduzível
+```
+
+### Os testes
+
+152 casos, **nenhum toca a AWS**. Os clientes SQS e CloudWatch são substituídos
+por dublês via fixture `autouse`, para que um teste que esquecesse a fixture não
+publicasse na fila de verdade.
 
 ```bash
 ./run.sh
 ```
 
 ```text
-145 passed
+152 passed
 ```
 
-Manualmente:
+Manualmente, sem o script:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m pytest
+.venv/bin/python local_simulator.py 200 10
 ```
 
 | Arquivo | Casos | O que cobre |
@@ -211,6 +330,7 @@ python3 -m venv .venv
 | `test_producer_handler.py` | 33 | requisição, lotes, orçamento de tempo, chave de API |
 | `test_generator.py` | 16 | variedade e correção das equações geradas |
 | `test_status_handler.py` | 33 | contadores, cursor de eventos, espiada na DLQ |
+| `test_local_simulator.py` | 7 | a simulação local roda e a contabilidade fecha |
 
 ## Implantando na AWS
 

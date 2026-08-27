@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# Bootstrap do ambiente de desenvolvimento e execucao dos testes.
+# Bootstrap do ambiente e execucao local. Nao precisa de credenciais AWS.
 #
-#   ./run.sh          cria o venv, instala as dependencias e roda os testes
+#   ./run.sh                 roda os testes
+#   ./run.sh demo            simula o fluxo event-driven (200 equacoes)
+#   ./run.sh demo 1000 25    1000 equacoes, 25% invalidas
 #
-# Nao precisa de credenciais AWS: os testes sao todos locais, exercitando os
-# handlers com eventos sinteticos.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -18,6 +18,12 @@ if [ ! -d "$VENV_DIR" ]; then
 fi
 
 PYTHON="$VENV_DIR/bin/python"
+
+# O simulador usa apenas a biblioteca padrao; o venv existe para o pytest.
+if [ "${1:-}" = "demo" ]; then
+  shift
+  exec "$PYTHON" local_simulator.py "$@"
+fi
 
 if ! "$PYTHON" -c 'import pytest' >/dev/null 2>&1; then
   echo "Instalando dependencias ..."
