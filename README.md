@@ -4,13 +4,12 @@ Arquitetura orientada a eventos (event-driven) para cálculo de equações do
 segundo grau na AWS, com filas SQS, Lambdas assíncronas e infraestrutura
 declarada em Terraform.
 
-> **Estado atual: Ciclo 3 concluído — output e DLQ.**
+> **Estado atual: Ciclo 4 concluído — producer.**
 >
-> O fluxo `orders → worker → results` está completo, com dead letter queue e
-> retry. Uma mensagem `{"a": 1, "b": -5, "c": 6}` publicada na `orders` é
-> resolvida de forma assíncrona e o resultado aparece na `results`; uma
-> mensagem inválida vai para a DLQ com o motivo anexado. Ainda não há producer
-> nem API — eles entram no Ciclo 4.
+> Uma única requisição `POST /orders {"quantity": 1000}` gera mil equações na
+> fila e elas são processadas de forma assíncrona: 960 resultados na `results`,
+> 40 recusas na DLQ, fila drenada em menos de 30 s. Ainda não há API de status
+> nem painel — eles entram nos Ciclos 5 e 6.
 
 Este é o **Checkpoint 2** de um trabalho em duas partes. O Checkpoint 1 é uma
 API serverless síncrona (`API Gateway → Lambda → resposta HTTP`) que vive em
@@ -52,13 +51,22 @@ Destino do projeto, ao fim dos 7 ciclos:
                  └─────────────┘  └────────────────┘
 ```
 
-O que existe **hoje**, no Ciclo 3:
+O que existe **hoje**, no Ciclo 4:
 
 ```text
-   aws sqs send-message
-   {"a": 1, "b": -5, "c": 6}
+   POST /orders  {"quantity": 1000}
+   x-api-key: <chave>
             │
             ▼
+   ┌───────────────────────┐
+   │  API Gateway HTTP API │  throttling 5 rps
+   └───────────┬───────────┘
+               ▼
+   ┌───────────────────────┐
+   │    Producer Lambda    │  gera equações variadas
+   └───────────┬───────────┘
+               │ SendMessageBatch (10 por chamada)
+               ▼
     ┌───────────────┐     event source      ┌────────────────┐
     │  SQS orders   │───────mapping────────►│ Worker Lambda  │
     └───────┬───────┘                       │  calculate()   │
@@ -86,7 +94,7 @@ O que existe **hoje**, no Ciclo 3:
 | 1 | Infraestrutura de mensageria: SQS orders, worker Lambda, event source mapping, IAM, logs | ✅ concluído |
 | 2 | Bhaskara event-driven: worker passa a calcular usando `calculator.py` | ✅ concluído |
 | 3 | Output e DLQ: fila `results`, DLQ, retry, tratamento de erro | ✅ concluído |
-| 4 | Producer: gerar N mensagens a partir de uma única requisição | ⬜ |
+| 4 | Producer: gerar N mensagens a partir de uma única requisição | ✅ concluído |
 | 5 | API de status: métricas do processamento | ⬜ |
 | 6 | Web dashboard: disparar a carga e acompanhar visualmente | ⬜ |
 | 7 | Polimento e entrega | ⬜ |
@@ -105,18 +113,26 @@ bhaskara-events/
 │   ├── shared/
 │   │   └── calculator.py       # regra de negócio (reutilizada do Checkpoint 1)
 │   └── handlers/
-│       └── worker/
-│           └── handler.py      # consome a fila orders
+│       ├── worker/
+│       │   └── handler.py      # consome a fila orders
+│       └── producer/
+│           ├── handler.py      # recebe POST /orders e publica em lotes
+│           └── generator.py    # constrói as equações
 ├── tests/
-│   ├── test_calculator.py      # 18 casos, herdados do Checkpoint 1
-│   └── test_worker_handler.py  # 45 casos, contrato com a SQS, cálculo e falhas
+│   ├── test_calculator.py         # 18 casos, herdados do Checkpoint 1
+│   ├── test_worker_handler.py     # 45 casos, contrato com a SQS, cálculo e falhas
+│   ├── test_generator.py          # 16 casos, variedade e correção das equações
+│   └── test_producer_handler.py   # 33 casos, requisição, lotes e chave de API
 ├── infra/                      # Terraform
 │   ├── versions.tf  main.tf  variables.tf  outputs.tf
 │   ├── sqs.tf                  # filas orders, results e DLQ
-│   ├── iam.tf                  # role e política do worker
-│   └── worker.tf               # Lambda, log group, event source mapping
+│   ├── iam.tf                  # roles e políticas do worker e do producer
+│   ├── worker.tf               # Lambda, log group, event source mapping
+│   ├── producer.tf             # Lambda, log group, chave de API
+│   └── apigateway.tf           # HTTP API, rota POST /orders, throttling
 ├── scripts/
-│   └── send-test-message.sh    # validação ponta a ponta do ciclo
+│   ├── send-test-message.sh    # publica direto na fila (sem passar pela API)
+│   └── generate-load.sh        # dispara carga pelo endpoint e acompanha as filas
 └── docs/
     └── cycle-01.md
 ```
@@ -144,7 +160,7 @@ Não precisa de credenciais AWS — os testes são todos locais.
 ```
 
 ```text
-63 passed
+112 passed
 ```
 
 Manualmente:
@@ -184,7 +200,47 @@ terraform output -raw tail_worker_logs
 | `aws_lambda_function` | `bhaskara-events-dev-worker` | Python 3.13, arm64, 128 MB, timeout 10 s |
 | `aws_lambda_event_source_mapping` | — | batch 10, janela 0 s, `ReportBatchItemFailures` |
 | `aws_iam_role` + `aws_iam_role_policy` | `bhaskara-events-dev-worker-role` | ARN restrito, sem `Resource: "*"` |
-| `aws_cloudwatch_log_group` | `/aws/lambda/bhaskara-events-dev-worker` | retenção 7 dias, removido no `destroy` |
+| `aws_lambda_function` | `bhaskara-events-dev-producer` | Python 3.13, arm64, 256 MB, timeout 30 s |
+| `aws_apigatewayv2_api` + rota + stage | `bhaskara-events-dev` | HTTP API, `POST /orders`, throttling 5 rps |
+| `random_password` | — | chave de API, 40 caracteres, output `sensitive` |
+| `aws_iam_role` + `aws_iam_role_policy` | `…-producer-role` | `sqs:SendMessage` apenas na `orders` |
+| `aws_cloudwatch_log_group` | `/aws/lambda/bhaskara-events-dev-{worker,producer}` | retenção 7 dias, removidos no `destroy` |
+
+## Gerando carga
+
+Uma única requisição gera milhares de equações:
+
+```bash
+./scripts/generate-load.sh              # 1.000 mensagens válidas
+./scripts/generate-load.sh 1000 0.05    # 1.000 com 5% inválidas, para ver a DLQ
+```
+
+O script dispara a requisição e acompanha as três filas até a `orders` drenar.
+
+Manualmente:
+
+```bash
+curl -s -X POST "$(terraform -chdir=infra output -raw producer_url)" \
+  -H "x-api-key: $(terraform -chdir=infra output -raw api_key)" \
+  -H 'Content-Type: application/json' \
+  -d '{"quantity": 1000}'
+```
+
+```json
+{"requested": 1000, "published": 1000, "batches": 100, "elapsed_ms": 4510}
+```
+
+| Campo | Obrigatório | Descrição |
+| --- | --- | --- |
+| `quantity` | sim | inteiro entre 1 e 5.000 |
+| `invalid_ratio` | não | proporção de mensagens inválidas, 0 a 1 (padrão 0) |
+| `seed` | não | torna a carga reproduzível |
+
+**A chave de API é obrigatória.** O endpoint gera carga — uma requisição vira
+até 5.000 mensagens — e sem autenticação seria um gerador de custo para quem o
+encontrasse. Sem a chave, a resposta é `403` e **nenhuma mensagem é gerada**.
+Obtenha a chave com `terraform output -raw api_key`; ela nunca é versionada.
+Detalhes em [`docs/cycle-04.md`](docs/cycle-04.md).
 
 ## Validando
 

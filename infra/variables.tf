@@ -176,3 +176,45 @@ variable "simulate_publish_failure" {
   type        = bool
   default     = false
 }
+
+variable "producer_memory_size" {
+  description = "Memoria do producer em MB. 256 e nao 128: a funcao gera milhares de payloads e faz centenas de chamadas de rede, e na Lambda a CPU e proporcional a memoria — mais memoria termina antes e pode custar o mesmo ou menos."
+  type        = number
+  default     = 256
+}
+
+variable "producer_timeout" {
+  description = "Timeout do producer em segundos. 30 e o teto util: o HTTP API corta a integracao em 30 s de qualquer forma, entao passar disso so mascararia o problema."
+  type        = number
+  default     = 30
+}
+
+variable "producer_max_quantity" {
+  description = "Teto de mensagens por requisicao. O endpoint dispara carga, entao sem limite uma unica chamada viraria custo e uma fila que o worker levaria muito tempo para drenar."
+  type        = number
+  default     = 5000
+}
+
+variable "api_route_key" {
+  description = "Rota exposta pelo API Gateway, no formato 'METODO /caminho'."
+  type        = string
+  default     = "POST /orders"
+}
+
+variable "throttling_rate_limit" {
+  description = "Requisicoes por segundo em regime permanente. Segunda linha de defesa depois da chave de API: limita quanto uma chave vazada consegue gerar."
+  type        = number
+  default     = 5
+}
+
+variable "throttling_burst_limit" {
+  description = "Pico instantaneo de requisicoes aceitas pelo stage."
+  type        = number
+  default     = 10
+}
+
+variable "cors_allow_origins" {
+  description = "Origens autorizadas a chamar a API pelo browser. O padrao '*' serve ao painel local do Ciclo 6; a chave de API continua sendo o que autoriza a chamada, CORS apenas diz de onde o browser pode tentar."
+  type        = list(string)
+  default     = ["*"]
+}

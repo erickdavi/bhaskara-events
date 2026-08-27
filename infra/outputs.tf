@@ -47,3 +47,34 @@ output "read_dlq" {
   description = "Comando pronto para inspecionar a DLQ, com o motivo da recusa."
   value       = "aws sqs receive-message --queue-url ${aws_sqs_queue.orders_dlq.url} --max-number-of-messages 10 --message-attribute-names All"
 }
+
+output "api_base_url" {
+  description = "URL base do HTTP API (stage $default, sem prefixo de stage)."
+  value       = aws_apigatewayv2_stage.default.invoke_url
+}
+
+output "producer_url" {
+  description = "URL completa do endpoint que dispara a geracao de mensagens."
+  value       = "${trimsuffix(aws_apigatewayv2_stage.default.invoke_url, "/")}${local.route_path}"
+}
+
+output "api_key" {
+  description = "Chave exigida no header x-api-key. Obtenha com 'terraform output -raw api_key'."
+  value       = random_password.api_key.result
+  sensitive   = true
+}
+
+output "producer_function_name" {
+  description = "Nome da funcao producer."
+  value       = aws_lambda_function.producer.function_name
+}
+
+output "producer_log_group" {
+  description = "Log group do producer."
+  value       = aws_cloudwatch_log_group.producer.name
+}
+
+output "generate_messages" {
+  description = "Comando pronto para gerar 1.000 mensagens. A chave sai de 'terraform output -raw api_key'."
+  value       = "curl -s -X POST '${trimsuffix(aws_apigatewayv2_stage.default.invoke_url, "/")}${local.route_path}' -H \"x-api-key: $(terraform -chdir=infra output -raw api_key)\" -H 'Content-Type: application/json' -d '{\"quantity\":1000}'"
+}
