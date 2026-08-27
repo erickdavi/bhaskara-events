@@ -1,86 +1,134 @@
 #!/usr/bin/env bash
 #
-# Validacao do Ciclo 1: publica mensagem(ns) na fila orders e comprova, pelo
-# CloudWatch, que o worker recebeu e consumiu cada uma.
+# Validacao ponta a ponta: publica equacoes na fila orders e comprova, pelo
+# CloudWatch, que o worker calculou (ou recusou) cada uma delas.
 #
-#   ./scripts/send-test-message.sh        1 mensagem
-#   ./scripts/send-test-message.sh 10     lote de 10 (send-message-batch)
+#   ./scripts/send-test-message.sh              1 equacao valida
+#   ./scripts/send-test-message.sh 10           10 equacoes variadas
+#   ./scripts/send-test-message.sh --invalid    lote de mensagens invalidas
 #
 # Requer credenciais AWS ativas e um terraform apply ja aplicado.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-COUNT="${1:-1}"
+MODE="valid"
+COUNT=1
+
+case "${1:-}" in
+  --invalid) MODE="invalid" ;;
+  "")        ;;
+  *)         COUNT="$1" ;;
+esac
 
 QUEUE_URL="$(terraform -chdir=infra output -raw orders_queue_url)"
 LOG_GROUP="$(terraform -chdir=infra output -raw worker_log_group)"
 
-# Marco temporal para a consulta do log: so interessa o que for gerado a partir
-# daqui, e nao mensagens de execucoes anteriores.
+# Marco temporal: so interessa o que for gerado a partir daqui, e nao o log de
+# execucoes anteriores.
 START_MS=$(( $(date +%s) * 1000 ))
 
 echo "Fila:  $QUEUE_URL"
-echo "Log:   $LOG_GROUP"
+echo "Modo:  $MODE ($COUNT mensagem(ns))"
 echo
 
-if [ "$COUNT" -eq 1 ]; then
-  MESSAGE_IDS="$(
-    aws sqs send-message \
-      --queue-url "$QUEUE_URL" \
-      --message-body '{"ping":"cycle-1"}' \
-      --query 'MessageId' --output text
-  )"
-else
-  # A SQS aceita no maximo 10 mensagens por send-message-batch.
-  ENTRIES="$(
-    python3 -c "
-import json, sys
-n = int(sys.argv[1])
+# As entradas do send-message-batch sao geradas aqui. No modo invalid, cada
+# linha exercita um caminho de recusa diferente — e o que o Ciclo 3 vai usar
+# para demonstrar a DLQ.
+ENTRIES="$(
+  python3 - "$MODE" "$COUNT" <<'PY'
+import json
+import sys
+
+mode, count = sys.argv[1], int(sys.argv[2])
+
+if mode == "invalid":
+    bodies = [
+        "nao e json",                       # JSON malformado
+        '{"a": 1, "b": -5}',                # coeficiente ausente
+        '{"a": 0, "b": 5, "c": 10}',        # nao e equacao do segundo grau
+        '{"a": "1", "b": -5, "c": 6}',      # coeficiente como string
+        '{"a": 1, "b": 1e200, "c": 1}',     # estoura o ponto flutuante
+    ]
+else:
+    # Equacoes com raizes conhecidas, cobrindo os tres desfechos possiveis:
+    # duas raizes reais, raiz dupla e nenhuma raiz real.
+    catalog = [
+        (1, -5, 6),     # x1=3,  x2=2
+        (1, -4, 4),     # raiz dupla em 2
+        (1, 2, 5),      # delta < 0, sem raizes reais
+        (2, -7, 3),     # x1=3,  x2=0.5
+        (1, 0, -4),     # x1=2,  x2=-2
+    ]
+    bodies = [
+        json.dumps(dict(zip("abc", catalog[i % len(catalog)])))
+        for i in range(count)
+    ]
+
 print(json.dumps([
-    {'Id': 'm%d' % i, 'MessageBody': json.dumps({'ping': 'cycle-1', 'seq': i})}
-    for i in range(n)
+    {"Id": "m%d" % i, "MessageBody": body} for i, body in enumerate(bodies)
 ]))
-" "$COUNT"
-  )"
+PY
+)"
 
-  MESSAGE_IDS="$(
-    aws sqs send-message-batch \
-      --queue-url "$QUEUE_URL" \
-      --entries "$ENTRIES" \
-      --query 'Successful[].MessageId' --output text | tr '\t' '\n'
-  )"
-fi
+# A SQS aceita no maximo 10 mensagens por send-message-batch.
+MESSAGE_IDS="$(
+  python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin)))" <<< "$ENTRIES" \
+  | python3 -c "
+import json, subprocess, sys
 
-echo "Publicado(s):"
-echo "$MESSAGE_IDS" | sed 's/^/  /'
+entries = json.load(sys.stdin)
+url = sys.argv[1]
+ids = []
+
+for i in range(0, len(entries), 10):
+    chunk = entries[i:i + 10]
+    for n, entry in enumerate(chunk):
+        entry['Id'] = 'm%d' % n
+    out = subprocess.run(
+        ['aws', 'sqs', 'send-message-batch', '--queue-url', url,
+         '--entries', json.dumps(chunk), '--query', 'Successful[].MessageId',
+         '--output', 'text'],
+        capture_output=True, text=True, check=True,
+    )
+    ids.extend(out.stdout.split())
+
+print('\n'.join(ids))
+" "$QUEUE_URL"
+)"
+
+TOTAL=$(echo "$MESSAGE_IDS" | grep -c . || true)
+echo "Publicadas: $TOTAL mensagem(ns)"
 echo
 
 echo "Aguardando o worker processar ..."
 sleep 15
 
 echo "=== Log do worker ==="
-aws logs tail "$LOG_GROUP" --since 2m --format short || true
+aws logs tail "$LOG_GROUP" --since 2m --format short \
+  | grep -E '"event": "message_(processed|rejected)"' || true
 echo
 
-echo "=== Cada MessageId publicado apareceu no log? ==="
-FOUND=0
-TOTAL=0
+echo "=== Cada mensagem publicada teve um desfecho no log? ==="
+OK=0
 while read -r id; do
   [ -n "$id" ] || continue
-  TOTAL=$((TOTAL + 1))
-  if aws logs filter-log-events \
-       --log-group-name "$LOG_GROUP" \
-       --start-time "$START_MS" \
-       --filter-pattern "\"$id\"" \
-       --query 'events[0].message' --output text | grep -q "$id"; then
-    echo "  OK    $id"
-    FOUND=$((FOUND + 1))
+  OUTCOME="$(
+    aws logs filter-log-events \
+      --log-group-name "$LOG_GROUP" \
+      --start-time "$START_MS" \
+      --filter-pattern "\"$id\"" \
+      --query 'events[].message' --output text \
+    | grep -oE 'message_(processed|rejected)' | tail -1
+  )"
+  if [ -n "$OUTCOME" ]; then
+    echo "  $OUTCOME  $id"
+    OK=$((OK + 1))
   else
-    echo "  FALHA $id"
+    echo "  SEM DESFECHO  $id"
   fi
 done <<< "$MESSAGE_IDS"
-echo "  $FOUND/$TOTAL encontrados"
+echo "  $OK/$TOTAL com desfecho registrado"
 echo
 
 echo "=== Fila drenada? (esperado: 0 e 0) ==="

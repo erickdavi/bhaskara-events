@@ -4,11 +4,12 @@ Arquitetura orientada a eventos (event-driven) para cálculo de equações do
 segundo grau na AWS, com filas SQS, Lambdas assíncronas e infraestrutura
 declarada em Terraform.
 
-> **Estado atual: Ciclo 1 concluído — infraestrutura de mensageria.**
+> **Estado atual: Ciclo 2 concluído — Bhaskara event-driven.**
 >
-> A fila `orders` e o worker Lambda estão no ar e o caminho `SQS → Lambda`
-> está comprovado ponta a ponta. O worker ainda **não calcula** — ele recebe,
-> registra e confirma o consumo. O cálculo entra no Ciclo 2.
+> A fila `orders` e o worker Lambda estão no ar: uma mensagem
+> `{"a": 1, "b": -5, "c": 6}` publicada na fila é resolvida de forma assíncrona
+> e o resultado aparece no CloudWatch. Ainda não há fila `results` nem DLQ —
+> elas entram no Ciclo 3.
 
 Este é o **Checkpoint 2** de um trabalho em duas partes. O Checkpoint 1 é uma
 API serverless síncrona (`API Gateway → Lambda → resposta HTTP`) que vive em
@@ -50,21 +51,26 @@ Destino do projeto, ao fim dos 7 ciclos:
                  └─────────────┘  └────────────────┘
 ```
 
-O que existe **hoje**, no Ciclo 1:
+O que existe **hoje**, no Ciclo 2:
 
 ```text
    aws sqs send-message
+   {"a": 1, "b": -5, "c": 6}
             │
             ▼
     ┌───────────────┐     event source      ┌────────────────┐
     │  SQS orders   │───────mapping────────►│ Worker Lambda  │
-    └───────────────┘                       └───────┬────────┘
+    └───────────────┘                       │  calculate()   │
+                                            └───────┬────────┘
                                                     │
+                                    ┌───────────────┴───────────────┐
+                                    ▼                               ▼
+                          message_processed               message_rejected
+                          delta, x1, x2                   reason
+                                    └───────────────┬───────────────┘
                                                     ▼
                                           ┌──────────────────┐
                                           │ CloudWatch Logs  │
-                                          │  (uma linha JSON │
-                                          │   por mensagem)  │
                                           └──────────────────┘
 ```
 
@@ -73,7 +79,7 @@ O que existe **hoje**, no Ciclo 1:
 | Ciclo | Escopo | Status |
 | --- | --- | --- |
 | 1 | Infraestrutura de mensageria: SQS orders, worker Lambda, event source mapping, IAM, logs | ✅ concluído |
-| 2 | Bhaskara event-driven: worker passa a calcular usando `calculator.py` | ⬜ |
+| 2 | Bhaskara event-driven: worker passa a calcular usando `calculator.py` | ✅ concluído |
 | 3 | Output e DLQ: fila `results`, DLQ, retry, tratamento de erro | ⬜ |
 | 4 | Producer: gerar N mensagens a partir de uma única requisição | ⬜ |
 | 5 | API de status: métricas do processamento | ⬜ |
@@ -98,7 +104,7 @@ bhaskara-events/
 │           └── handler.py      # consome a fila orders
 ├── tests/
 │   ├── test_calculator.py      # 18 casos, herdados do Checkpoint 1
-│   └── test_worker_handler.py  # 10 casos, contrato com a SQS
+│   └── test_worker_handler.py  # 33 casos, contrato com a SQS e o cálculo
 ├── infra/                      # Terraform
 │   ├── versions.tf  main.tf  variables.tf  outputs.tf
 │   ├── sqs.tf                  # fila orders
@@ -133,7 +139,7 @@ Não precisa de credenciais AWS — os testes são todos locais.
 ```
 
 ```text
-28 passed
+51 passed
 ```
 
 Manualmente:
@@ -175,12 +181,13 @@ terraform output -raw tail_worker_logs
 
 ## Validando
 
-O script faz o ciclo completo: publica, espera, confere que cada `MessageId`
-publicado apareceu no log e mostra se a fila foi drenada.
+O script faz o ciclo completo: publica, espera, confere que cada mensagem
+publicada teve um desfecho no log e mostra se a fila foi drenada.
 
 ```bash
-./scripts/send-test-message.sh        # uma mensagem
-./scripts/send-test-message.sh 10     # lote de 10
+./scripts/send-test-message.sh              # uma equação válida
+./scripts/send-test-message.sh 10           # dez equações variadas
+./scripts/send-test-message.sh --invalid    # lote de mensagens inválidas
 ```
 
 Manualmente:
@@ -188,18 +195,33 @@ Manualmente:
 ```bash
 QUEUE_URL="$(terraform -chdir=infra output -raw orders_queue_url)"
 
-aws sqs send-message --queue-url "$QUEUE_URL" --message-body '{"ping":"cycle-1"}'
+aws sqs send-message --queue-url "$QUEUE_URL" --message-body '{"a":1,"b":-5,"c":6}'
 aws logs tail /aws/lambda/bhaskara-events-dev-worker --since 5m --format short
 ```
 
-O worker emite uma linha JSON por mensagem:
+O worker emite uma linha JSON por evento:
 
 ```json
-{"event": "message_received", "request_id": "3772...", "message_id": "bc96...", "receive_count": 1, "body": "{\"ping\":\"cycle-1\"}"}
+{"event": "message_processed", "message_id": "88a3...", "a": 1, "b": -5, "c": 6, "delta": 1, "x1": 3.0, "x2": 2.0}
+{"event": "message_rejected",  "message_id": "32e8...", "reason": "Coeficientes ausentes: c."}
 ```
 
 JSON e não texto livre porque o painel do Ciclo 6 vai ler estes mesmos campos, e
 o CloudWatch Logs Insights consulta JSON por campo sem precisar de parser.
+
+### Contrato da mensagem
+
+```json
+{"a": 1, "b": -5, "c": 6}
+```
+
+A validação é estrita: o corpo é JSON, então número chega como número — uma
+string `"1"` no lugar de `1` é recusada, porque aceitá-la esconderia um producer
+com defeito. `a = 0`, valores não finitos e coeficientes que estouram o ponto
+flutuante também são recusados, pelas regras do próprio `calculator.py`.
+
+**Mensagens inválidas são registradas e descartadas neste ciclo** — a DLQ que
+lhes dará destino entra no Ciclo 3. Ver [`docs/cycle-02.md`](docs/cycle-02.md).
 
 ## Decisões de infraestrutura
 

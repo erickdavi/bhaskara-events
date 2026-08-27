@@ -8,10 +8,12 @@ resource "aws_cloudwatch_log_group" "worker" {
 }
 
 # O zip e montado a partir de arquivos explicitos, e nao de um source_dir, para
-# que cada funcao leve apenas o que usa. A partir do Ciclo 2 entra aqui um
-# segundo bloco com shared/calculator.py, que a Lambda espera encontrar na raiz
-# do pacote (o handler importa "from calculator import calculate", sem prefixo
-# de pacote).
+# que cada funcao leve apenas o que usa.
+#
+# Os dois arquivos vao para a raiz do pacote, lado a lado, porque e assim que a
+# Lambda resolve o import: o handler faz "from calculator import calculate",
+# sem prefixo de pacote. Um subdiretorio shared/ dentro do zip exigiria mexer
+# no sys.path em runtime, sem ganho nenhum.
 data "archive_file" "worker" {
   type        = "zip"
   output_path = "${path.module}/build/${local.worker_function_name}.zip"
@@ -19,6 +21,12 @@ data "archive_file" "worker" {
   source {
     content  = file("${local.src_dir}/handlers/worker/handler.py")
     filename = "handler.py"
+  }
+
+  # Regra de negocio compartilhada, herdada do Checkpoint 1.
+  source {
+    content  = file("${local.src_dir}/shared/calculator.py")
+    filename = "calculator.py"
   }
 }
 
