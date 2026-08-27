@@ -153,4 +153,61 @@ CloudWatch Logs, não defeitos. O painel trata as duas explicitamente.
 | 5 | `.gitignore` correto, lock versionado | ✅ |
 | 6 | Segurança revisada | ✅ CSP, HSTS, CORS, IAM, bucket privado |
 | 7 | Custos documentados | ✅ tabela contra o free tier |
-| 8 | `destroy` limpo, sem resíduo | ⏸️ **não executado** — a stack foi mantida no ar. É o único critério ainda em aberto, pendente desde o Ciclo 1. |
+| 8 | `destroy` limpo, sem resíduo | ✅ executado e verificado — ver abaixo |
+
+
+## O ciclo destroy → apply, executado
+
+O último critério em aberto desde o Ciclo 1 — provar que o `destroy` não deixa
+resíduo — foi fechado executando o ciclo completo contra a conta real.
+
+### Destroy
+
+```text
+Destroy complete! Resources: 37 destroyed.
+```
+
+Inventário na conta, por categoria, antes e depois:
+
+| Categoria | Antes | Depois |
+| --- | --- | --- |
+| Filas SQS | 3 | **0** |
+| Funções Lambda | 3 | **0** |
+| Log groups | 3 | **0** |
+| Roles IAM | 3 | **0** |
+| Buckets S3 | 1 | **0** |
+| Distribuições CloudFront | 1 | **0** |
+| APIs HTTP | 1 | **0** |
+
+State vazio, **zero resíduo**. E o Checkpoint 1, em outra stack, continuou
+respondendo normalmente durante todo o processo — a separação entre os dois
+projetos vale também para o `destroy`.
+
+O log group ser removido junto é consequência de tê-lo declarado no Terraform
+desde o Ciclo 1. Se a Lambda o criasse sozinha no primeiro invoke, ele ficaria
+fora do state e sobreviveria a cada `destroy`, acumulando resíduo.
+
+### Apply do zero
+
+```text
+Apply complete! Resources: 37 added, 0 changed, 0 destroyed.
+real  2m56s
+```
+
+Os 37 recursos reconstruídos em **menos de três minutos**, num único comando,
+sem nenhum passo manual. Validação da stack nova:
+
+| Verificação | Resultado |
+| --- | --- |
+| `POST /orders` sem chave | `403` |
+| Acesso direto ao bucket S3 | `AccessDenied` |
+| CSP servida pelo CloudFront | presente |
+| Chave no `config.js` publicado | ausente |
+| Carga de 600 mensagens com 10% inválidas | `543 + 57 = 600` |
+| Painel no browser | carrega, console limpo |
+
+A primeira leitura do `/status` durante a drenagem mostrou `396 sucessos, 0
+falhas` — o contador da DLQ ainda assentando, exatamente o comportamento
+documentado no Ciclo 6.
+
+**Todos os critérios dos sete ciclos estão cumpridos.**
