@@ -51,6 +51,18 @@ MAX_DLQ_PEEK = 10
 # Janela padrao dos eventos quando o cliente nao manda cursor.
 DEFAULT_EVENTS_WINDOW_MS = 60_000
 
+# Passado maximo que uma consulta de eventos alcanca.
+#
+# Existe por uma peculiaridade do filter_log_events: com startTime muito antigo
+# ele varre o log desde o inicio e pode devolver uma pagina VAZIA junto de um
+# nextToken, em vez dos eventos recentes. Um cliente que mandasse since=0 —
+# um painel recem-aberto, por exemplo — receberia zero eventos e um cursor que
+# nunca avanca, ficando travado para sempre.
+#
+# Limitar o alcance faz a consulta mirar o passado recente, que e o unico que
+# interessa a um painel ao vivo.
+MAX_EVENTS_LOOKBACK_MS = 900_000
+
 # Apenas os desfechos: sao eles que o painel conta e exibe. Filtrar aqui, e nao
 # depois de receber, faz o trabalho acontecer no CloudWatch em vez de na Lambda.
 OUTCOME_FILTER = (
@@ -82,7 +94,9 @@ def lambda_handler(event, context):
 
     if events_limit:
         body["events"], body["events_cursor"] = recent_events(
-            events_limit, since if since is not None else now_ms - DEFAULT_EVENTS_WINDOW_MS
+            events_limit,
+            since if since is not None else now_ms - DEFAULT_EVENTS_WINDOW_MS,
+            now_ms,
         )
 
     if dlq_limit:
@@ -123,13 +137,18 @@ def depth(queue_url, with_in_flight=False):
     )
 
 
-def recent_events(limit, since_ms):
+def recent_events(limit, since_ms, now_ms):
     """Devolve os desfechos registrados apos `since_ms`, do mais antigo ao mais novo.
 
     A ordem crescente e o cursor existem para o painel: ele guarda o cursor da
     ultima consulta e pede so o que veio depois, montando um fluxo continuo em
     vez de rebuscar a mesma janela a cada poll.
+
+    O cursor devolvido nunca e menor que o piso da janela: e o que tira um
+    cliente parado no passado do limbo em que o filter_log_events o deixaria.
     """
+    since_ms = max(since_ms, now_ms - MAX_EVENTS_LOOKBACK_MS)
+
     if not WORKER_LOG_GROUP:
         return [], since_ms
 

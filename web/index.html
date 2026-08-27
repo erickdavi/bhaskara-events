@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Bhaskara Events — painel</title>
+<!-- Favicon embutido: o bucket e privado e nao serve /favicon.ico, e a
+     requisicao automatica do browser virava um 403 no console. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%E2%88%9A%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+<!-- Gerado pelo Terraform com a URL da API. Ausente num clone local, e a
+     pagina cai no campo de configuracao. A chave NUNCA vem daqui: ela e
+     digitada pelo operador e fica so no localStorage do browser. -->
+<script src="config.js" onerror="window.BHASKARA_CONFIG=window.BHASKARA_CONFIG||{}"></script>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Bhaskara Events</h1>
+    <span class="subtitle" style="margin:0">processamento assíncrono de equações do segundo grau</span>
+  </header>
+  <p class="subtitle">
+    Uma requisição gera N equações na fila <code>orders</code>. O worker consome, resolve
+    e publica em <code>results</code> — o que falha vai para a DLQ.
+  </p>
+
+  <div class="banner" id="banner" hidden></div>
+
+  <section class="card" style="margin-bottom:18px">
+    <h2>Configuração</h2>
+    <div class="controls">
+      <div class="field field--wide">
+        <label for="api-base">URL da API</label>
+        <input id="api-base" type="url" placeholder="https://xxxx.execute-api.us-east-1.amazonaws.com" autocomplete="off">
+      </div>
+      <div class="field field--wide">
+        <label for="api-key">Chave de API <span style="color:var(--text-muted)">(terraform output -raw api_key)</span></label>
+        <input id="api-key" type="password" placeholder="cole a chave aqui" autocomplete="off">
+      </div>
+      <button class="ghost" id="save-config" type="button">Salvar</button>
+    </div>
+  </section>
+
+  <section class="card" style="margin-bottom:18px">
+    <h2>Gerar carga</h2>
+    <div class="controls">
+      <div class="field">
+        <label for="quantity">Quantidade</label>
+        <input id="quantity" type="number" min="1" max="5000" step="1" value="1000">
+      </div>
+      <div class="field">
+        <label for="invalid">Inválidas (%)</label>
+        <input id="invalid" type="number" min="0" max="100" step="1" value="5">
+      </div>
+      <button id="generate" type="button">Gerar mensagens</button>
+      <button class="ghost" id="reset" type="button">Zerar contadores</button>
+    </div>
+  </section>
+
+  <div class="kpis">
+    <div class="kpi">
+      <div class="kpi-label"><span class="dot dot--queued"></span> ⏳ Aguardando</div>
+      <div class="kpi-value" id="kpi-queued">—</div>
+      <div class="kpi-note">na fila orders</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label"><span class="dot dot--flight"></span> ⚙️ Em processamento</div>
+      <div class="kpi-value" id="kpi-flight">—</div>
+      <div class="kpi-note">entregues ao worker</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label"><span class="dot dot--ok"></span> ✓ Sucessos</div>
+      <div class="kpi-value" id="kpi-ok">—</div>
+      <div class="kpi-note" id="kpi-ok-total">—</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label"><span class="dot dot--fail"></span> ! Falhas (DLQ)</div>
+      <div class="kpi-value" id="kpi-fail">—</div>
+      <div class="kpi-note" id="kpi-fail-total">—</div>
+    </div>
+  </div>
+
+  <section class="card">
+    <div class="progress-head">
+      <h2 style="margin:0">Progresso desta execução</h2>
+      <span class="progress-count" id="progress-count">nenhuma carga disparada</span>
+    </div>
+    <div class="meter" role="img" aria-labelledby="progress-count">
+      <span class="ok" id="bar-ok" style="width:0%"></span>
+      <span class="fail" id="bar-fail" style="width:0%"></span>
+    </div>
+    <div class="legend">
+      <span class="legend-item"><span class="dot dot--ok"></span> ✓ processadas com sucesso</span>
+      <span class="legend-item"><span class="dot dot--fail"></span> ! encaminhadas para a DLQ</span>
+    </div>
+  </section>
+
+  <section class="card" style="margin-top:18px">
+    <h2>Fila aguardando processamento</h2>
+    <div class="chart-wrap">
+      <svg id="chart" viewBox="0 0 900 200" preserveAspectRatio="none" role="img"
+           aria-label="Mensagens aguardando na fila orders ao longo do tempo"></svg>
+    </div>
+  </section>
+
+  <div class="panels">
+    <section class="card">
+      <h2>Eventos do processamento</h2>
+      <ul class="stream" id="stream">
+        <li class="placeholder">Aguardando eventos…</li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>Mensagens na DLQ</h2>
+      <ul class="dlq" id="dlq">
+        <li class="placeholder">Nenhuma mensagem inspecionada.</li>
+      </ul>
+    </section>
+  </div>
+
+  <p class="foot">
+    Os contadores de sucesso e falha vêm da profundidade das filas <code>results</code> e
+    <code>orders-dlq</code>, que ninguém consome — são acumulados desde a última limpeza.
+    “Nesta execução” subtrai a leitura tirada no momento em que a carga foi disparada.
+    Os atributos da SQS são eventualmente consistentes e podem oscilar poucas unidades
+    entre leituras; os eventos vêm do CloudWatch Logs, que leva alguns segundos para
+    tornar uma linha consultável.
+  </p>
+
+</div>
+<script src="app.js"></script>
+</body>
+</html>

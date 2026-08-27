@@ -7,8 +7,18 @@ resource "aws_apigatewayv2_api" "this" {
   # sem CORS o browser bloquearia a chamada antes mesmo de sair. x-api-key
   # precisa constar em allow_headers: nao e um header simples, e sem ele o
   # preflight falharia.
+  # Origem restrita a distribuicao do painel, e nao "*". Ate o Ciclo 5 nao
+  # havia origem conhecida para nomear; agora ha. CORS nao autoriza nada — quem
+  # autoriza e a chave de API — mas fecha a porta para uma pagina de terceiros
+  # tentar usar a chave de um operador logado.
+  #
+  # extra_cors_origins existe para o desenvolvimento local (por exemplo
+  # http://localhost:8000), e vem vazio por padrao.
   cors_configuration {
-    allow_origins = var.cors_allow_origins
+    allow_origins = concat(
+      ["https://${aws_cloudfront_distribution.dashboard.domain_name}"],
+      var.extra_cors_origins,
+    )
     allow_methods = ["POST", "GET", "OPTIONS"]
     allow_headers = ["content-type", "x-api-key"]
     max_age       = 300

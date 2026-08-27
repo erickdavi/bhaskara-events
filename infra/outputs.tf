@@ -93,3 +93,13 @@ output "read_status" {
   description = "Comando pronto para consultar as metricas."
   value       = "curl -s '${trimsuffix(aws_apigatewayv2_stage.default.invoke_url, "/")}${local.status_route_path}' -H \"x-api-key: $(terraform -chdir=infra output -raw api_key)\""
 }
+
+output "dashboard_url" {
+  description = "URL do painel web. A chave de API e colada na propria pagina e fica so no browser."
+  value       = "https://${aws_cloudfront_distribution.dashboard.domain_name}"
+}
+
+output "dashboard_bucket" {
+  description = "Bucket privado que guarda os arquivos do painel."
+  value       = aws_s3_bucket.dashboard.id
+}

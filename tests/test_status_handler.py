@@ -6,10 +6,26 @@ um fluxo com cursor, e a espiada na DLQ que nao pode consumir nada.
 """
 
 import json
+import time
 
 import pytest
 
 from src.handlers.status import handler as status
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def ago(seconds):
+    """Timestamp recente.
+
+    Os testes de evento usam instantes proximos do agora, e nao numeros
+    pequenos como 1000: a funcao limita a janela de busca ao passado recente,
+    entao um timestamp de 1970 seria empurrado para o piso da janela e o teste
+    nao estaria mais medindo o que pretende.
+    """
+    return now_ms() - int(seconds * 1000)
 
 API_KEY = "chave-de-teste-123"
 
@@ -165,8 +181,8 @@ def test_the_fast_path_does_not_query_logs_or_the_dlq(aws):
 def test_events_are_returned_when_requested(aws):
     _, logs = aws
     logs.events = [
-        log_entry(1000, message_id="a"),
-        log_entry(2000, message_id="b"),
+        log_entry(ago(30), message_id="a"),
+        log_entry(ago(20), message_id="b"),
     ]
 
     _, body = call({"events": "10", "since": "0"})
@@ -176,38 +192,43 @@ def test_events_are_returned_when_requested(aws):
 
 def test_events_carry_their_timestamp(aws):
     _, logs = aws
-    logs.events = [log_entry(1500, message_id="a")]
+    moment = ago(25)
+    logs.events = [log_entry(moment, message_id="a")]
 
     _, body = call({"events": "10", "since": "0"})
 
-    assert body["events"][0]["timestamp"] == 1500
+    assert body["events"][0]["timestamp"] == moment
 
 
 def test_the_cursor_is_the_newest_timestamp(aws):
     _, logs = aws
-    logs.events = [log_entry(1000), log_entry(2500), log_entry(1800)]
+    newest = ago(10)
+    logs.events = [log_entry(ago(40)), log_entry(newest), log_entry(ago(25))]
 
     _, body = call({"events": "10", "since": "0"})
 
-    assert body["events_cursor"] == 2500
+    assert body["events_cursor"] == newest
 
 
 def test_the_cursor_excludes_the_last_delivered_event(aws):
     # Sem o +1 no startTime, cada poll devolveria de novo o ultimo evento do
     # poll anterior e o painel mostraria duplicatas.
     _, logs = aws
-    logs.events = [log_entry(2000)]
+    moment = ago(20)
+    logs.events = [log_entry(moment)]
 
-    call({"events": "10", "since": "2000"})
+    call({"events": "10", "since": str(moment)})
 
-    assert logs.calls[0]["startTime"] == 2001
+    assert logs.calls[0]["startTime"] == moment + 1
 
 
 def test_the_cursor_stays_put_when_nothing_new_happened(aws):
-    _, body = call({"events": "10", "since": "5000"})
+    moment = ago(15)
+
+    _, body = call({"events": "10", "since": str(moment)})
 
     assert body["events"] == []
-    assert body["events_cursor"] == 5000
+    assert body["events_cursor"] == moment
 
 
 def test_only_outcome_events_are_requested(aws):
@@ -238,16 +259,17 @@ def test_events_default_to_a_recent_window(aws):
 
 def test_lines_that_are_not_json_are_skipped(aws):
     _, logs = aws
+    newest = ago(20)
     logs.events = [
-        {"timestamp": 1000, "message": "START RequestId: abc"},
-        log_entry(2000, message_id="b"),
+        {"timestamp": ago(30), "message": "START RequestId: abc"},
+        log_entry(newest, message_id="b"),
     ]
 
-    _, body = call({"events": "10", "since": "0"})
+    _, body = call({"events": "10", "since": str(ago(60))})
 
     assert [entry["message_id"] for entry in body["events"]] == ["b"]
     # O cursor avanca mesmo assim: a linha foi vista, so nao interessava.
-    assert body["events_cursor"] == 2000
+    assert body["events_cursor"] == newest
 
 
 # --- espiada na DLQ ---------------------------------------------------------
@@ -378,3 +400,43 @@ def test_response_carries_the_moment_it_was_measured(aws):
     _, body = call()
 
     assert isinstance(body["checked_at"], int)
+
+
+# --- limite da janela de busca ---------------------------------------------
+
+
+def test_a_very_old_cursor_is_clamped_to_the_lookback_window(aws):
+    # O filter_log_events com startTime muito antigo varre o log desde o inicio
+    # e pode devolver pagina vazia com nextToken. Um painel que mandasse since=0
+    # receberia zero eventos e um cursor que nunca avanca — travado para sempre.
+    _, logs = aws
+
+    call({"events": "10", "since": "0"})
+
+    requested = logs.calls[0]["startTime"]
+    floor = now_ms() - status.MAX_EVENTS_LOOKBACK_MS
+
+    assert requested >= floor
+
+
+def test_the_cursor_never_comes_back_below_the_window(aws):
+    # Sem isto, o cliente reenviaria o mesmo cursor antigo para sempre.
+    _, body = call({"events": "10", "since": "0"})
+
+    floor = now_ms() - status.MAX_EVENTS_LOOKBACK_MS
+
+    assert body["events_cursor"] >= floor
+
+
+def test_a_recent_cursor_is_left_alone(aws):
+    # O limite so age sobre cursores antigos; o fluxo normal nao muda.
+    recent = now_ms() - 5000
+
+    call({"events": "10", "since": str(recent)})
+
+    assert logs_start_time(aws) == recent + 1
+
+
+def logs_start_time(aws):
+    _, logs = aws
+    return logs.calls[0]["startTime"]

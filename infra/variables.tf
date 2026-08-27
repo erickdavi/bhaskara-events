@@ -213,10 +213,10 @@ variable "throttling_burst_limit" {
   default     = 10
 }
 
-variable "cors_allow_origins" {
-  description = "Origens autorizadas a chamar a API pelo browser. O padrao '*' serve ao painel local do Ciclo 6; a chave de API continua sendo o que autoriza a chamada, CORS apenas diz de onde o browser pode tentar."
+variable "extra_cors_origins" {
+  description = "Origens adicionais autorizadas a chamar a API pelo browser, alem da distribuicao do painel. Serve ao desenvolvimento local (ex.: http://localhost:8000). Vazio por padrao."
   type        = list(string)
-  default     = ["*"]
+  default     = []
 }
 
 variable "status_route_key" {

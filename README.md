@@ -4,12 +4,17 @@ Arquitetura orientada a eventos (event-driven) para cálculo de equações do
 segundo grau na AWS, com filas SQS, Lambdas assíncronas e infraestrutura
 declarada em Terraform.
 
-> **Estado atual: Ciclo 5 concluído — API de status.**
+> **Estado atual: Ciclo 6 concluído — painel web.**
 >
-> `POST /orders {"quantity": 1000}` gera mil equações e `GET /status` devolve o
-> andamento em ~100 ms: quantas aguardam, quantas estão em processamento,
-> quantos sucessos, quantas falhas, um fluxo de eventos com cursor e uma
-> espiada na DLQ. Falta o painel, que entra no Ciclo 6.
+> O sistema está completo e demonstrável. Abra o painel, informe a quantidade,
+> clique em **Gerar mensagens** e acompanhe: a fila enchendo e drenando, os
+> contadores de sucesso e falha, as equações sendo resolvidas em tempo quase
+> real e as mensagens que foram para a DLQ, com o motivo.
+>
+> ```bash
+> terraform -chdir=infra output -raw dashboard_url   # abra no browser
+> terraform -chdir=infra output -raw api_key         # cole no painel
+> ```
 
 Este é o **Checkpoint 2** de um trabalho em duas partes. O Checkpoint 1 é uma
 API serverless síncrona (`API Gateway → Lambda → resposta HTTP`) que vive em
@@ -51,12 +56,15 @@ Destino do projeto, ao fim dos 7 ciclos:
                  └─────────────┘  └────────────────┘
 ```
 
-O que existe **hoje**, no Ciclo 4:
+O que existe **hoje** é a arquitetura completa do diagrama acima. O fluxo de
+uma demonstração:
 
 ```text
-   POST /orders  {"quantity": 1000}
-   x-api-key: <chave>
+   Painel (CloudFront + S3 privado)
+   quantidade, % inválidas, [Gerar]
             │
+            │ POST /orders  {"quantity": 1000}
+            │ x-api-key: <chave>
             ▼
    ┌───────────────────────┐        GET /status
    │  API Gateway HTTP API │◄───────────────────┐
@@ -97,7 +105,7 @@ O que existe **hoje**, no Ciclo 4:
 | 3 | Output e DLQ: fila `results`, DLQ, retry, tratamento de erro | ✅ concluído |
 | 4 | Producer: gerar N mensagens a partir de uma única requisição | ✅ concluído |
 | 5 | API de status: métricas do processamento | ✅ concluído |
-| 6 | Web dashboard: disparar a carga e acompanhar visualmente | ⬜ |
+| 6 | Web dashboard: disparar a carga e acompanhar visualmente | ✅ concluído |
 | 7 | Polimento e entrega | ⬜ |
 
 Cada ciclo termina em um estado funcional e testável, documentado em
@@ -135,7 +143,12 @@ bhaskara-events/
 │   ├── worker.tf               # Lambda, log group, event source mapping
 │   ├── producer.tf             # Lambda, log group, chave de API
 │   ├── status.tf               # Lambda de métricas
-│   └── apigateway.tf           # HTTP API, rotas POST /orders e GET /status
+│   ├── apigateway.tf           # HTTP API, rotas POST /orders e GET /status
+│   └── dashboard.tf            # S3 privado + CloudFront do painel
+├── web/                        # painel: publicado no S3 pelo Terraform
+│   ├── index.html
+│   ├── styles.css
+│   └── app.js
 ├── scripts/
 │   ├── send-test-message.sh    # publica direto na fila (sem passar pela API)
 │   └── generate-load.sh        # dispara carga pelo endpoint e acompanha as filas
@@ -145,7 +158,7 @@ bhaskara-events/
 
 A separação segue quatro camadas independentes: **regra de negócio**
 (`src/shared`), **processamento de eventos** (`src/handlers`), **infraestrutura**
-(`infra`) e, a partir do Ciclo 6, **frontend** (`web/`).
+(`infra`) e **frontend** (`web/`).
 
 ### Sobre `calculator.py`
 
@@ -166,7 +179,7 @@ Não precisa de credenciais AWS — os testes são todos locais.
 ```
 
 ```text
-142 passed
+145 passed
 ```
 
 Manualmente:
@@ -212,6 +225,7 @@ terraform output -raw tail_worker_logs
 | `random_password` | — | chave de API, 40 caracteres, output `sensitive` |
 | `aws_iam_role` + `aws_iam_role_policy` | `…-producer-role` | `sqs:SendMessage` apenas na `orders` |
 | `aws_iam_role` + `aws_iam_role_policy` | `…-status-role` | só leitura: sem `SendMessage`, sem `DeleteMessage` |
+| `aws_s3_bucket` + `aws_cloudfront_distribution` | `…-dashboard-<conta>` | bucket **privado**, servido só via CloudFront com Origin Access Control |
 | `aws_cloudwatch_log_group` | `/aws/lambda/bhaskara-events-dev-{worker,producer,status}` | retenção 7 dias, removidos no `destroy` |
 
 ## Gerando carga
@@ -249,6 +263,25 @@ até 5.000 mensagens — e sem autenticação seria um gerador de custo para que
 encontrasse. Sem a chave, a resposta é `403` e **nenhuma mensagem é gerada**.
 Obtenha a chave com `terraform output -raw api_key`; ela nunca é versionada.
 Detalhes em [`docs/cycle-04.md`](docs/cycle-04.md).
+
+## O painel
+
+```bash
+terraform -chdir=infra output -raw dashboard_url   # abra no browser
+terraform -chdir=infra output -raw api_key         # cole no campo do painel
+```
+
+Informe a quantidade e a proporção de mensagens inválidas, clique em **Gerar
+mensagens** e acompanhe a fila enchendo e drenando, os contadores de sucesso e
+falha, o fluxo de equações resolvidas e as mensagens da DLQ com o motivo.
+
+> **A chave de API não está no bundle.** A página é pública no CloudFront, e uma
+> chave embutida seria uma chave publicada. Ela é colada no painel e fica apenas
+> no `localStorage` daquele browser. O bucket, por sua vez, nunca é público:
+> todo acesso passa pelo CloudFront via Origin Access Control.
+
+Detalhes de desenho e os três defeitos que o teste E2E encontrou estão em
+[`docs/cycle-06.md`](docs/cycle-06.md).
 
 ## Acompanhando o processamento
 

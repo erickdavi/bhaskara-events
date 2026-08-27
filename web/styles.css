@@ -1,0 +1,231 @@
+/* Tokens.
+   As cores de dado seguem o metodo: paleta categorica validada para separacao
+   de daltonismo (blue/orange, PASS em light e dark) e paleta de status fixa
+   para sucesso e falha. Os numeros grandes usam tokens de texto, nunca a cor da
+   serie — a identidade fica no ponto colorido ao lado do rotulo. */
+:root {
+  color-scheme: light;
+
+  --surface-0: #f4f3f0;
+  --surface-1: #fcfcfb;
+  --surface-2: #eceae5;
+  --border:    #dcd9d2;
+
+  --text-primary:   #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted:     #7a7873;
+
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+
+  --good:     #0ca30c;
+  --critical: #d03b3b;
+  --warning:  #fab219;
+
+  --radius: 10px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --surface-0: #121211;
+    --surface-1: #1a1a19;
+    --surface-2: #242422;
+    --border:    #383835;
+
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #8d8c84;
+
+    --series-1: #3987e5;
+    --series-2: #d95926;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --surface-0: #121211;
+  --surface-1: #1a1a19;
+  --surface-2: #242422;
+  --border:    #383835;
+
+  --text-primary:   #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted:     #8d8c84;
+
+  --series-1: #3987e5;
+  --series-2: #d95926;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 24px 20px 48px;
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.wrap { max-width: 1180px; margin: 0 auto; }
+
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; margin-bottom: 6px; }
+h1 { font-size: 21px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+.subtitle { color: var(--text-secondary); font-size: 14px; margin: 0 0 22px; }
+
+.card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px;
+}
+
+h2 {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  margin: 0 0 14px;
+}
+
+/* --- controles ---------------------------------------------------------- */
+
+.controls { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; margin-bottom: 18px; }
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field label { font-size: 12px; color: var(--text-secondary); font-weight: 500; }
+
+input {
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+  min-width: 0;
+}
+input:focus-visible { outline: 2px solid var(--series-1); outline-offset: 1px; }
+input[type="number"] { width: 120px; }
+.field--wide input { width: 340px; font-family: var(--mono); font-size: 13px; }
+
+button {
+  font: inherit;
+  font-weight: 600;
+  padding: 9px 20px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: var(--series-1);
+  color: #fff;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { filter: brightness(1.08); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button:focus-visible { outline: 2px solid var(--text-primary); outline-offset: 2px; }
+button.ghost { background: transparent; color: var(--text-secondary); border-color: var(--border); font-weight: 500; }
+
+.banner {
+  padding: 11px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-size: 14px;
+  margin-bottom: 18px;
+  display: flex;
+  gap: 9px;
+  align-items: baseline;
+}
+.banner[data-tone="error"] { border-color: var(--critical); color: var(--text-primary); }
+.banner[data-tone="ok"]    { border-color: var(--good); }
+.banner[hidden] { display: none; }
+
+/* --- KPIs --------------------------------------------------------------- */
+
+.kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.kpi { background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--radius); padding: 15px 16px; }
+
+.kpi-label {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12px; font-weight: 500; color: var(--text-secondary);
+  margin-bottom: 7px;
+}
+
+/* O ponto carrega a identidade; o numero fica em tinta de texto. Cada rotulo
+   traz tambem um icone, para que a cor nunca seja o unico portador do sentido. */
+.dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.dot--queued     { background: var(--series-1); }
+.dot--flight     { background: var(--series-2); }
+.dot--ok         { background: var(--good); }
+.dot--fail       { background: var(--critical); }
+
+.kpi-value {
+  font-size: 30px; font-weight: 620; line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+.kpi-note { font-size: 12px; color: var(--text-muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
+
+/* --- progresso ---------------------------------------------------------- */
+
+.progress-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; gap: 12px; }
+.progress-count { font-size: 14px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+
+/* Os 2px de vao entre segmentos sao a cor da superficie, nao transparencia:
+   e o que impede duas faixas adjacentes de se lerem como uma so. */
+.meter { display: flex; gap: 2px; height: 12px; background: var(--surface-2); border-radius: 6px; overflow: hidden; }
+.meter span { display: block; transition: width 400ms ease; }
+.meter .ok   { background: var(--good); }
+.meter .fail { background: var(--critical); }
+
+.legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 11px; font-size: 12px; color: var(--text-secondary); }
+.legend-item { display: flex; align-items: center; gap: 6px; }
+
+/* --- grafico ------------------------------------------------------------ */
+
+.chart-wrap { overflow-x: auto; }
+svg { display: block; width: 100%; height: auto; }
+.grid-line { stroke: var(--border); stroke-width: 1; }
+.axis-text { fill: var(--text-muted); font-size: 11px; font-family: system-ui, sans-serif; }
+.series-line { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.series-area { fill: var(--series-1); opacity: 0.10; }
+.empty-note { fill: var(--text-muted); font-size: 12px; font-family: system-ui, sans-serif; }
+
+/* --- paineis inferiores ------------------------------------------------- */
+
+.panels { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 18px; }
+@media (max-width: 860px) { .panels { grid-template-columns: 1fr; } }
+
+.stream, .dlq { max-height: 340px; overflow-y: auto; margin: 0; padding: 0; list-style: none; }
+
+.stream li, .dlq li {
+  display: flex; gap: 9px; align-items: baseline;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  font-family: var(--mono);
+}
+.stream li:last-child, .dlq li:last-child { border-bottom: 0; }
+
+.time { color: var(--text-muted); flex: none; font-size: 12px; }
+.tag { flex: none; font-weight: 600; display: flex; align-items: center; gap: 5px; }
+.tag--ok   { color: var(--good); }
+.tag--fail { color: var(--critical); }
+.tag--warn { color: var(--warning); }
+.detail { color: var(--text-secondary); overflow-wrap: anywhere; }
+
+.dlq .reason { color: var(--text-secondary); }
+.dlq .body { color: var(--text-primary); }
+
+.placeholder { color: var(--text-muted); font-size: 13px; padding: 8px 0; }
+
+.foot { margin-top: 26px; font-size: 12px; color: var(--text-muted); }
+.foot code { font-family: var(--mono); }
