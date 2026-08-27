@@ -1,0 +1,83 @@
+# Python
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing
+
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Type checkers / linters
+
+.mypy_cache/
+.ruff_cache/
+
+# IDEs and editors
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+
+.DS_Store
+Thumbs.db
+
+# Environment variables / secrets
+#
+# Nada de credencial no repositorio: as credenciais AWS vem do ambiente
+# (aws configure / variaveis de ambiente), nunca de um arquivo versionado.
+
+.env
+.env.*
+!.env.example
+
+# AWS
+
+.aws/
+
+# Terraform
+#
+# O state guarda ARNs, IDs de conta e atributos de recurso — nao vai para o Git.
+# Os tfvars podem conter valores especificos do ambiente de quem aplica.
+
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Pacotes da Lambda gerados pelo archive_file
+
+*.zip
+
+# Logs
+
+*.log
+logs/

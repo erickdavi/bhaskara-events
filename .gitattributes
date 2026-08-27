@@ -1,0 +1,11 @@
+# Fim de linha por tipo de arquivo, para que os scripts funcionem em qualquer
+# checkout. Sem isso, um clone no Windows pode receber um .sh com CRLF e o bash
+# falha com "bad interpreter".
+* text=auto
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.tf   text eol=lf
+*.hcl  text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
