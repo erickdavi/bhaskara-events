@@ -10,16 +10,18 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%E2%88%9A%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
 <!-- Gerado pelo Terraform com a URL da API. Ausente num clone local, e a
-     pagina cai no campo de configuracao. A chave NUNCA vem daqui: ela e
-     digitada pelo operador e fica so no localStorage do browser. -->
-<script src="config.js" onerror="window.BHASKARA_CONFIG=window.BHASKARA_CONFIG||{}"></script>
+     pagina cai no campo de configuracao — o app.js ja trata a ausencia com
+     window.BHASKARA_CONFIG || {}, entao nao ha onerror inline (que a CSP
+     bloquearia). A chave NUNCA vem daqui: ela e digitada pelo operador e
+     fica so no localStorage do browser. -->
+<script src="config.js"></script>
 </head>
 <body>
 <div class="wrap">
 
   <header>
     <h1>Bhaskara Events</h1>
-    <span class="subtitle" style="margin:0">processamento assíncrono de equações do segundo grau</span>
+    <span class="subtitle flush">processamento assíncrono de equações do segundo grau</span>
   </header>
   <p class="subtitle">
     Uma requisição gera N equações na fila <code>orders</code>. O worker consome, resolve
@@ -28,7 +30,7 @@
 
   <div class="banner" id="banner" hidden></div>
 
-  <section class="card" style="margin-bottom:18px">
+  <section class="card card--spaced">
     <h2>Configuração</h2>
     <div class="controls">
       <div class="field field--wide">
@@ -36,14 +38,14 @@
         <input id="api-base" type="url" placeholder="https://xxxx.execute-api.us-east-1.amazonaws.com" autocomplete="off">
       </div>
       <div class="field field--wide">
-        <label for="api-key">Chave de API <span style="color:var(--text-muted)">(terraform output -raw api_key)</span></label>
+        <label for="api-key">Chave de API <span class="hint">(terraform output -raw api_key)</span></label>
         <input id="api-key" type="password" placeholder="cole a chave aqui" autocomplete="off">
       </div>
       <button class="ghost" id="save-config" type="button">Salvar</button>
     </div>
   </section>
 
-  <section class="card" style="margin-bottom:18px">
+  <section class="card card--spaced">
     <h2>Gerar carga</h2>
     <div class="controls">
       <div class="field">
@@ -84,12 +86,12 @@
 
   <section class="card">
     <div class="progress-head">
-      <h2 style="margin:0">Progresso desta execução</h2>
+      <h2 class="flush">Progresso desta execução</h2>
       <span class="progress-count" id="progress-count">nenhuma carga disparada</span>
     </div>
     <div class="meter" role="img" aria-labelledby="progress-count">
-      <span class="ok" id="bar-ok" style="width:0%"></span>
-      <span class="fail" id="bar-fail" style="width:0%"></span>
+      <span class="ok" id="bar-ok"></span>
+      <span class="fail" id="bar-fail"></span>
     </div>
     <div class="legend">
       <span class="legend-item"><span class="dot dot--ok"></span> ✓ processadas com sucesso</span>
@@ -97,7 +99,7 @@
     </div>
   </section>
 
-  <section class="card" style="margin-top:18px">
+  <section class="card card--top">
     <h2>Fila aguardando processamento</h2>
     <div class="chart-wrap">
       <svg id="chart" viewBox="0 0 900 200" preserveAspectRatio="none" role="img"

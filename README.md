@@ -1,178 +1,192 @@
 # Bhaskara Events
 
-Arquitetura orientada a eventos (event-driven) para cálculo de equações do
-segundo grau na AWS, com filas SQS, Lambdas assíncronas e infraestrutura
-declarada em Terraform.
+Arquitetura orientada a eventos para cálculo de equações do segundo grau na AWS.
+Uma requisição gera milhares de equações numa fila; funções Lambda as resolvem
+de forma assíncrona; um painel web mostra tudo acontecendo.
 
-> **Estado atual: Ciclo 6 concluído — painel web.**
->
-> O sistema está completo e demonstrável. Abra o painel, informe a quantidade,
-> clique em **Gerar mensagens** e acompanhe: a fila enchendo e drenando, os
-> contadores de sucesso e falha, as equações sendo resolvidas em tempo quase
-> real e as mensagens que foram para a DLQ, com o motivo.
->
-> ```bash
-> terraform -chdir=infra output -raw dashboard_url   # abra no browser
-> terraform -chdir=infra output -raw api_key         # cole no painel
-> ```
+> **Checkpoint 2 — event-driven.** O [Checkpoint 1](https://github.com/erickdavi/bhaskara-api)
+> é uma API serverless **síncrona** (`API Gateway → Lambda → resposta HTTP`) e
+> vive em outro repositório, sem alteração. Este projeto é independente dele:
+> a mesma regra de negócio, uma arquitetura completamente diferente ao redor.
 
-Este é o **Checkpoint 2** de um trabalho em duas partes. O Checkpoint 1 é uma
-API serverless síncrona (`API Gateway → Lambda → resposta HTTP`) que vive em
-[outro repositório](https://github.com/erickdavi/bhaskara-api), e continua no ar
-sem alteração. Este projeto é independente dele: mesma regra de negócio, uma
-arquitetura completamente diferente ao redor.
+```bash
+git clone git@github.com:erickdavi/bhaskara-events.git
+cd bhaskara-events
+./run.sh                                            # 145 testes, sem AWS
+cd infra && terraform init && terraform apply       # ~5 min
+terraform output -raw dashboard_url                 # abra no browser
+terraform output -raw api_key                       # cole no painel
+```
+
+## Índice
+
+- [Arquitetura](#arquitetura)
+- [Como funciona](#como-funciona)
+- [Estrutura do projeto](#estrutura-do-projeto)
+- [Pré-requisitos](#pré-requisitos)
+- [Executando os testes](#executando-os-testes)
+- [Implantando na AWS](#implantando-na-aws)
+- [Usando o painel](#usando-o-painel)
+- [A API](#a-api)
+- [Validando pela linha de comando](#validando-pela-linha-de-comando)
+- [Recursos criados](#recursos-criados)
+- [Segurança](#segurança)
+- [Custos](#custos)
+- [Limpeza](#limpeza)
+- [Limitações conhecidas](#limitações-conhecidas)
+- [Decisões de arquitetura](#decisões-de-arquitetura)
+- [Histórico de desenvolvimento](#histórico-de-desenvolvimento)
 
 ## Arquitetura
 
-Destino do projeto, ao fim dos 7 ciclos:
-
 ```text
-                      ┌───────────────────────┐
-                      │     Web Dashboard     │
-                      └───────────┬───────────┘
-              POST /orders        │       GET /status
-                {"quantity": N}   │
-                      ┌───────────▼───────────┐
-                      │  API Gateway HTTP API │
-                      └─────┬───────────┬─────┘
-                            │           │
-                  ┌─────────▼──┐   ┌────▼────────┐
-                  │  Producer  │   │   Status    │
-                  │   Lambda   │   │   Lambda    │
-                  └─────┬──────┘   └────┬────────┘
-        SendMessageBatch │               │ GetQueueAttributes
-                         ▼               │
-                  ┌─────────────┐        │
-                  │ SQS orders  │◄───────┘
-                  └─────┬───────┘
-                        │ event source mapping
-                  ┌─────▼───────────────┐
-                  │    Worker Lambda    │  usa shared/calculator.py
-                  └─────┬───────────┬───┘
-                sucesso │           │ falha → retry → maxReceiveCount
-                        ▼           ▼
-                 ┌─────────────┐  ┌────────────────┐
-                 │ SQS results │  │ SQS orders-dlq │
-                 └─────────────┘  └────────────────┘
+                    ┌───────────────────────────────┐
+                    │   Painel  (CloudFront + S3)   │
+                    │   quantidade · [Gerar]        │
+                    └───────┬───────────────┬───────┘
+        POST /orders        │               │        GET /status
+        {"quantity": 1000}  │               │
+                    ┌───────▼───────────────▼───────┐
+                    │     API Gateway (HTTP API)    │   throttling 5 rps
+                    └───────┬───────────────┬───────┘   chave em x-api-key
+                            │               │
+                  ┌─────────▼──────┐   ┌────▼───────────┐
+                  │    Producer    │   │     Status     │
+                  │ gera equações  │   │ lê as 3 filas  │
+                  └─────────┬──────┘   └────┬───────────┘
+         SendMessageBatch   │               │ GetQueueAttributes
+              (10 por vez)  │               │ + FilterLogEvents
+                            ▼               │
+                     ┌─────────────┐        │
+                     │ SQS orders  │◄───────┘
+                     └──────┬──────┘
+                            │ event source mapping (lote de 10)
+                     ┌──────▼──────────────┐
+                     │    Worker Lambda    │  usa shared/calculator.py
+                     └──┬───────────────┬──┘
+              sucesso   │               │   inválida (erro permanente)
+                        ▼               │
+                 ┌─────────────┐        │
+                 │ SQS results │        │
+                 └─────────────┘        │
+                                        │
+     falha inesperada → batchItemFailures → retry ×3 → redrive
+                        │               │
+                        ▼               ▼
+                 ┌──────────────────────────────┐
+                 │       SQS orders-dlq         │
+                 └──────────────────────────────┘
 ```
 
-O que existe **hoje** é a arquitetura completa do diagrama acima. O fluxo de
-uma demonstração:
+## Como funciona
 
-```text
-   Painel (CloudFront + S3 privado)
-   quantidade, % inválidas, [Gerar]
-            │
-            │ POST /orders  {"quantity": 1000}
-            │ x-api-key: <chave>
-            ▼
-   ┌───────────────────────┐        GET /status
-   │  API Gateway HTTP API │◄───────────────────┐
-   └───────────┬───────────┘                    │
-               ▼                     ┌──────────┴──────────┐
-   ┌───────────────────────┐         │    Status Lambda    │
-   │    Producer Lambda    │         │ lê as três filas +  │
-   └───────────┬───────────┘         │  log do worker      │
-               │                     └─────────────────────┘
-               │ SendMessageBatch (10 por chamada)
-               ▼
-    ┌───────────────┐     event source      ┌────────────────┐
-    │  SQS orders   │───────mapping────────►│ Worker Lambda  │
-    └───────┬───────┘                       │  calculate()   │
-            │                               └───┬────────┬───┘
-            │ redrive_policy                    │        │
-            │ maxReceiveCount = 3       sucesso │        │ inválida
-            │                                   ▼        │
-            │                          ┌─────────────┐   │
-            │                          │ SQS results │   │
-            │                          └─────────────┘   │
-            │                                            │
-            │  falha inesperada ──► batchItemFailures    │
-            │         └── retry ──┘                      │
-            ▼                                            ▼
-    ┌──────────────────────────────────────────────────────┐
-    │                  SQS orders-dlq                      │
-    │   (mensagem inválida chega com RejectionReason)      │
-    └──────────────────────────────────────────────────────┘
-```
+1. O painel envia `POST /orders {"quantity": 1000}`.
+2. O **producer** gera mil equações e as publica na `orders` em 100 lotes de
+   `SendMessageBatch`, respondendo `202` em poucos segundos — sem esperar o
+   processamento.
+3. O **event source mapping** entrega lotes de até 10 mensagens ao **worker**,
+   escalando sozinho.
+4. O worker resolve cada equação com `calculator.py` e publica o resultado na
+   `results`. O que não dá para resolver vai para a **DLQ**, com o motivo.
+5. O painel consulta `GET /status` a cada 2 s e mostra a fila enchendo,
+   drenando, os contadores e as equações resolvidas.
 
-### Desenvolvimento incremental
+### Os dois caminhos de falha
 
-| Ciclo | Escopo | Status |
+Falha permanente e falha inesperada **não compartilham o mesmo caminho**:
+
+| | Permanente | Inesperada |
 | --- | --- | --- |
-| 1 | Infraestrutura de mensageria: SQS orders, worker Lambda, event source mapping, IAM, logs | ✅ concluído |
-| 2 | Bhaskara event-driven: worker passa a calcular usando `calculator.py` | ✅ concluído |
-| 3 | Output e DLQ: fila `results`, DLQ, retry, tratamento de erro | ✅ concluído |
-| 4 | Producer: gerar N mensagens a partir de uma única requisição | ✅ concluído |
-| 5 | API de status: métricas do processamento | ✅ concluído |
-| 6 | Web dashboard: disparar a carga e acompanhar visualmente | ✅ concluído |
-| 7 | Polimento e entrega | ⬜ |
+| Exemplos | JSON malformado, coeficiente ausente, `a = 0`, overflow | falha ao publicar, indisponibilidade, permissão revogada |
+| Reentregar ajuda? | Não — o desfecho seria idêntico | Sim |
+| O que o worker faz | publica na DLQ e **confirma** a mensagem | devolve o `messageId` em `batchItemFailures` |
+| Como chega na DLQ | direto, com o motivo anexado | pelo `redrive_policy`, após 3 entregas |
 
-Cada ciclo termina em um estado funcional e testável, documentado em
-[`docs/`](docs/).
+Uma mensagem que chega pela DLQ nativa não traz motivo — a SQS move o payload
+original e não sabe por que ele falhou. É essa diferença que justifica os dois
+caminhos.
 
 ## Estrutura do projeto
 
 ```text
 bhaskara-events/
-├── conftest.py                 # sys.path dos testes = sys.path da Lambda
-├── run.sh                      # bootstrap do venv + testes
+├── conftest.py                    # sys.path dos testes = sys.path da Lambda
+├── run.sh                         # bootstrap do venv + testes
 ├── requirements.txt
 ├── src/
-│   ├── shared/
-│   │   ├── calculator.py       # regra de negócio (reutilizada do Checkpoint 1)
-│   │   └── api_auth.py         # verificação da chave, usada pelos dois handlers HTTP
-│   └── handlers/
-│       ├── worker/
-│       │   └── handler.py      # consome a fila orders
+│   ├── shared/                    # o que mais de um handler usa
+│   │   ├── calculator.py          # regra de negócio (cópia literal do CP1)
+│   │   └── api_auth.py            # verificação da chave de API
+│   └── handlers/                  # um diretório por função Lambda
+│       ├── worker/handler.py      # consome orders, resolve, publica em results
 │       ├── producer/
-│       │   ├── handler.py      # recebe POST /orders e publica em lotes
-│       │   └── generator.py    # constrói as equações
-│       └── status/
-│           └── handler.py      # responde GET /status
-├── tests/
-│   ├── test_calculator.py         # 18 casos, herdados do Checkpoint 1
-│   ├── test_worker_handler.py     # 45 casos, contrato com a SQS, cálculo e falhas
-│   ├── test_generator.py          # 16 casos, variedade e correção das equações
-│   ├── test_producer_handler.py   # 33 casos, requisição, lotes e chave de API
-│   └── test_status_handler.py     # 30 casos, contadores, cursor e espiada na DLQ
-├── infra/                      # Terraform
+│       │   ├── handler.py         # recebe POST /orders, publica em lotes
+│       │   └── generator.py       # constrói as equações
+│       └── status/handler.py      # responde GET /status
+├── tests/                         # 145 casos, nenhum toca a AWS
+├── infra/                         # Terraform
 │   ├── versions.tf  main.tf  variables.tf  outputs.tf
-│   ├── sqs.tf                  # filas orders, results e DLQ
-│   ├── iam.tf                  # roles e políticas do worker e do producer
-│   ├── worker.tf               # Lambda, log group, event source mapping
-│   ├── producer.tf             # Lambda, log group, chave de API
-│   ├── status.tf               # Lambda de métricas
-│   ├── apigateway.tf           # HTTP API, rotas POST /orders e GET /status
-│   └── dashboard.tf            # S3 privado + CloudFront do painel
-├── web/                        # painel: publicado no S3 pelo Terraform
-│   ├── index.html
-│   ├── styles.css
-│   └── app.js
+│   ├── sqs.tf                     # orders, results, DLQ
+│   ├── iam.tf                     # as três roles
+│   ├── worker.tf  producer.tf  status.tf
+│   ├── apigateway.tf              # HTTP API e as duas rotas
+│   └── dashboard.tf               # S3 privado + CloudFront
+├── web/                           # painel, publicado no S3 pelo Terraform
+│   ├── index.html  styles.css  app.js
 ├── scripts/
-│   ├── send-test-message.sh    # publica direto na fila (sem passar pela API)
-│   └── generate-load.sh        # dispara carga pelo endpoint e acompanha as filas
+│   ├── send-test-message.sh       # publica direto na fila, sem passar pela API
+│   └── generate-load.sh           # dispara pelo endpoint e acompanha as filas
 └── docs/
-    └── cycle-01.md
+    └── cycle-01.md … cycle-07.md  # uma nota por ciclo de desenvolvimento
 ```
 
-A separação segue quatro camadas independentes: **regra de negócio**
-(`src/shared`), **processamento de eventos** (`src/handlers`), **infraestrutura**
-(`infra`) e **frontend** (`web/`).
+Quatro camadas independentes: **regra de negócio** (`src/shared`),
+**processamento de eventos** (`src/handlers`), **infraestrutura** (`infra`) e
+**frontend** (`web`).
 
 ### Sobre `calculator.py`
 
-O arquivo é uma cópia **literal**, byte a byte, do
-[Checkpoint 1](https://github.com/erickdavi/bhaskara-api) — junto com os seus 18
-testes. É a única coisa reaproveitada, e de propósito: a regra matemática é a
-mesma, o que muda é tudo ao redor dela. Ela é pura, usa só a biblioteca padrão e
-tem um contrato de erro único (`ValueError` para `a = 0`, valores não finitos e
-overflow), que é exatamente o que um worker precisa para classificar mensagem
-boa e mensagem ruim.
+Cópia **literal, byte a byte** do
+[Checkpoint 1](https://github.com/erickdavi/bhaskara-api), junto com os seus 18
+testes. É a única coisa reaproveitada, de propósito: a regra matemática é a
+mesma, o que muda é tudo ao redor. Ela é pura, usa só a biblioteca padrão e tem
+um contrato de erro único (`ValueError` para `a = 0`, valores não finitos e
+overflow) — exatamente o que um worker precisa para classificar mensagem boa e
+mensagem ruim.
+
+### Empacotamento
+
+Cada função tem seu próprio `data.archive_file`, montado a partir de arquivos
+explícitos. Os módulos vão para a **raiz do zip**, lado a lado, porque é assim
+que a Lambda resolve imports: o handler faz `from calculator import calculate`,
+sem prefixo de pacote.
+
+| Função | Conteúdo do zip |
+| --- | --- |
+| worker | `handler.py`, `calculator.py` |
+| producer | `handler.py`, `generator.py`, `api_auth.py` |
+| status | `handler.py`, `api_auth.py` |
+
+O `conftest.py` reproduz esse mesmo `sys.path` nos testes, para que eles
+exercitem os mesmos imports que rodam na nuvem.
+
+## Pré-requisitos
+
+| Ferramenta | Versão | Para quê |
+| --- | --- | --- |
+| Python | ≥ 3.9 | rodar os testes |
+| Terraform | ≥ 1.5 | provisionar |
+| AWS CLI | v2 | validar pela linha de comando |
+| Credenciais AWS | — | `aws sts get-caller-identity` deve responder |
+
+As permissões necessárias na conta: IAM, Lambda, SQS, API Gateway, CloudWatch
+Logs, S3 e CloudFront.
 
 ## Executando os testes
 
-Não precisa de credenciais AWS — os testes são todos locais.
+**Não precisa de credenciais AWS** — nenhum teste toca a nuvem. Os clientes SQS
+e CloudWatch são substituídos por dublês, via fixture `autouse`, para que um
+teste que esquecesse a fixture não publicasse na fila de verdade.
 
 ```bash
 ./run.sh
@@ -190,10 +204,15 @@ python3 -m venv .venv
 .venv/bin/python -m pytest
 ```
 
-## Implantando na AWS
+| Arquivo | Casos | O que cobre |
+| --- | --- | --- |
+| `test_calculator.py` | 18 | a regra matemática: precisão, ordem das raízes, limites numéricos |
+| `test_worker_handler.py` | 45 | contrato com a SQS, cálculo, DLQ e retry |
+| `test_producer_handler.py` | 33 | requisição, lotes, orçamento de tempo, chave de API |
+| `test_generator.py` | 16 | variedade e correção das equações geradas |
+| `test_status_handler.py` | 33 | contadores, cursor de eventos, espiada na DLQ |
 
-Pré-requisitos: Terraform >= 1.5, AWS CLI e credenciais ativas
-(`aws sts get-caller-identity` confirma).
+## Implantando na AWS
 
 ```bash
 cd infra
@@ -201,45 +220,48 @@ terraform init
 terraform apply
 ```
 
-Os comandos de validação saem prontos nos outputs:
+O `apply` leva **cerca de 5 minutos** — a distribuição CloudFront responde por
+quase todo esse tempo. Não há passo de build: o `archive_file` empacota o código
+durante o `plan`.
+
+Os outputs entregam tudo o que se precisa:
 
 ```bash
+terraform output -raw dashboard_url    # o painel
+terraform output -raw api_key          # a chave (sensitive; nunca versionada)
+terraform output -raw producer_url     # POST /orders
+terraform output -raw status_url       # GET /status
 terraform output -raw orders_queue_url
-terraform output -raw send_test_message
-terraform output -raw tail_worker_logs
 ```
 
-### Recursos criados
+## Usando o painel
 
-| Recurso | Nome | Observação |
-| --- | --- | --- |
-| `aws_sqs_queue` | `bhaskara-events-dev-orders` | entrada; visibility 60 s, retenção 4 dias, long polling 20 s, SSE, redrive para a DLQ após 3 entregas |
-| `aws_sqs_queue` | `bhaskara-events-dev-results` | saída; mesmos parâmetros |
-| `aws_sqs_queue` | `bhaskara-events-dev-orders-dlq` | dead letter queue; retenção 14 dias |
-| `aws_lambda_function` | `bhaskara-events-dev-worker` | Python 3.13, arm64, 128 MB, timeout 10 s |
-| `aws_lambda_event_source_mapping` | — | batch 10, janela 0 s, `ReportBatchItemFailures` |
-| `aws_iam_role` + `aws_iam_role_policy` | `bhaskara-events-dev-worker-role` | ARN restrito, sem `Resource: "*"` |
-| `aws_lambda_function` | `bhaskara-events-dev-producer` | Python 3.13, arm64, 256 MB, timeout 30 s |
-| `aws_lambda_function` | `bhaskara-events-dev-status` | Python 3.13, arm64, 128 MB, timeout 10 s |
-| `aws_apigatewayv2_api` + rotas + stage | `bhaskara-events-dev` | HTTP API, `POST /orders` e `GET /status`, throttling 5 rps |
-| `random_password` | — | chave de API, 40 caracteres, output `sensitive` |
-| `aws_iam_role` + `aws_iam_role_policy` | `…-producer-role` | `sqs:SendMessage` apenas na `orders` |
-| `aws_iam_role` + `aws_iam_role_policy` | `…-status-role` | só leitura: sem `SendMessage`, sem `DeleteMessage` |
-| `aws_s3_bucket` + `aws_cloudfront_distribution` | `…-dashboard-<conta>` | bucket **privado**, servido só via CloudFront com Origin Access Control |
-| `aws_cloudwatch_log_group` | `/aws/lambda/bhaskara-events-dev-{worker,producer,status}` | retenção 7 dias, removidos no `destroy` |
+1. Abra a URL do `dashboard_url`.
+2. Cole a chave do `api_key` no campo **Chave de API** e clique em **Salvar**.
+   Ela fica apenas no `localStorage` daquele browser.
+3. Informe a quantidade e a proporção de mensagens inválidas.
+4. Clique em **Gerar mensagens**.
 
-## Gerando carga
+O painel mostra, atualizando a cada 2 segundos:
 
-Uma única requisição gera milhares de equações:
+- **Aguardando** e **Em processamento** — a fila `orders`
+- **Sucessos** e **Falhas** — as filas `results` e `orders-dlq`
+- Barra de progresso desta execução
+- Gráfico da fila ao longo do tempo
+- Fluxo de eventos, como equações legíveis:
+  `6x² + 36x + 54 = 0 → x₁=-3 x₂=-3`
+- Mensagens da DLQ com o motivo da recusa
 
-```bash
-./scripts/generate-load.sh              # 1.000 mensagens válidas
-./scripts/generate-load.sh 1000 0.05    # 1.000 com 5% inválidas, para ver a DLQ
-```
+> **A chave não está no bundle.** A página é pública no CloudFront, e uma chave
+> embutida seria uma chave publicada. O `config.js` gerado pelo Terraform leva
+> apenas a URL da API.
 
-O script dispara a requisição e acompanha as três filas até a `orders` drenar.
+## A API
 
-Manualmente:
+Ambas as rotas exigem o header `x-api-key`. Sem ele, `403` e nenhuma carga é
+gerada.
+
+### `POST /orders` — gerar mensagens
 
 ```bash
 curl -s -X POST "$(terraform -chdir=infra output -raw producer_url)" \
@@ -258,38 +280,18 @@ curl -s -X POST "$(terraform -chdir=infra output -raw producer_url)" \
 | `invalid_ratio` | não | proporção de mensagens inválidas, 0 a 1 (padrão 0) |
 | `seed` | não | torna a carga reproduzível |
 
-**A chave de API é obrigatória.** O endpoint gera carga — uma requisição vira
-até 5.000 mensagens — e sem autenticação seria um gerador de custo para quem o
-encontrasse. Sem a chave, a resposta é `403` e **nenhuma mensagem é gerada**.
-Obtenha a chave com `terraform output -raw api_key`; ela nunca é versionada.
-Detalhes em [`docs/cycle-04.md`](docs/cycle-04.md).
+Resposta **202 Accepted**: as mensagens foram aceitas para processamento, que
+acontece depois e em outro lugar.
 
-## O painel
+Se a função chegar perto do corte de 30 s do API Gateway, ela para e responde
+`"truncated": true` com o que conseguiu publicar. Uma resposta honesta de
+"publiquei 3.210" é melhor que um timeout.
 
-```bash
-terraform -chdir=infra output -raw dashboard_url   # abra no browser
-terraform -chdir=infra output -raw api_key         # cole no campo do painel
-```
-
-Informe a quantidade e a proporção de mensagens inválidas, clique em **Gerar
-mensagens** e acompanhe a fila enchendo e drenando, os contadores de sucesso e
-falha, o fluxo de equações resolvidas e as mensagens da DLQ com o motivo.
-
-> **A chave de API não está no bundle.** A página é pública no CloudFront, e uma
-> chave embutida seria uma chave publicada. Ela é colada no painel e fica apenas
-> no `localStorage` daquele browser. O bucket, por sua vez, nunca é público:
-> todo acesso passa pelo CloudFront via Origin Access Control.
-
-Detalhes de desenho e os três defeitos que o teste E2E encontrou estão em
-[`docs/cycle-06.md`](docs/cycle-06.md).
-
-## Acompanhando o processamento
+### `GET /status` — acompanhar
 
 ```bash
-STATUS="$(terraform -chdir=infra output -raw status_url)"
-KEY="$(terraform -chdir=infra output -raw api_key)"
-
-curl -s "$STATUS" -H "x-api-key: $KEY"
+curl -s "$(terraform -chdir=infra output -raw status_url)" \
+  -H "x-api-key: $(terraform -chdir=infra output -raw api_key)"
 ```
 
 ```json
@@ -303,125 +305,134 @@ curl -s "$STATUS" -H "x-api-key: $KEY"
 | `dlq=N` | até 10 mensagens da DLQ com corpo e motivo, **sem consumi-las** |
 
 Sem parâmetros a resposta sai de três chamadas de `GetQueueAttributes` e a
-função executa em ~100 ms — rápido o bastante para o painel do Ciclo 6 fazer
-polling. Detalhes em [`docs/cycle-05.md`](docs/cycle-05.md).
+função executa em ~100 ms.
 
 > `succeeded` e `failed` são contadores **acumulados**, não por execução: nada
 > consome a `results` nem a DLQ, então elas são o placar desde a última limpeza.
-> Tire uma leitura antes de disparar a carga e subtraia.
+> O painel tira uma leitura antes de disparar a carga e subtrai.
 
-## Validando
-
-O script faz o ciclo completo: publica, espera, confere que cada mensagem
-publicada teve um desfecho no log e mostra se a fila foi drenada.
+## Validando pela linha de comando
 
 ```bash
-./scripts/send-test-message.sh              # uma equação válida
+./scripts/generate-load.sh              # 1.000 mensagens pelo endpoint
+./scripts/generate-load.sh 1000 0.05    # com 5% inválidas, para ver a DLQ
+
+./scripts/send-test-message.sh              # publica direto na fila
 ./scripts/send-test-message.sh 10           # dez equações variadas
-./scripts/send-test-message.sh --invalid    # lote de mensagens inválidas
+./scripts/send-test-message.sh --invalid    # cinco inválidas
 ```
 
-Manualmente:
+O `generate-load.sh` dispara a requisição e acompanha as três filas até a
+`orders` drenar. O `send-test-message.sh` pula a API e publica direto na fila —
+útil para testar o worker isoladamente.
+
+Logs:
 
 ```bash
-QUEUE_URL="$(terraform -chdir=infra output -raw orders_queue_url)"
-
-aws sqs send-message --queue-url "$QUEUE_URL" --message-body '{"a":1,"b":-5,"c":6}'
-aws logs tail /aws/lambda/bhaskara-events-dev-worker --since 5m --format short
+aws logs tail "$(terraform -chdir=infra output -raw worker_log_group)" --follow --format short
 ```
 
-O worker emite uma linha JSON por evento:
+## Recursos criados
 
-```json
-{"event": "message_processed", "message_id": "88a3...", "a": 1, "b": -5, "c": 6, "delta": 1, "x1": 3.0, "x2": 2.0}
-{"event": "message_rejected",  "message_id": "32e8...", "reason": "Coeficientes ausentes: c."}
-```
+**37 recursos gerenciados.** Nenhum tem custo fixo.
 
-JSON e não texto livre porque o painel do Ciclo 6 vai ler estes mesmos campos, e
-o CloudWatch Logs Insights consulta JSON por campo sem precisar de parser.
+| Recurso | Nome | Observação |
+| --- | --- | --- |
+| `aws_sqs_queue` | `…-orders` | entrada; visibility 60 s, retenção 4 dias, long polling 20 s, SSE, redrive após 3 entregas |
+| `aws_sqs_queue` | `…-results` | saída dos cálculos bem-sucedidos |
+| `aws_sqs_queue` | `…-orders-dlq` | dead letter queue; retenção 14 dias |
+| `aws_lambda_function` | `…-worker` | Python 3.13, arm64, 128 MB, 10 s |
+| `aws_lambda_function` | `…-producer` | Python 3.13, arm64, 256 MB, 30 s |
+| `aws_lambda_function` | `…-status` | Python 3.13, arm64, 128 MB, 10 s |
+| `aws_lambda_event_source_mapping` | — | batch 10, `ReportBatchItemFailures` |
+| `aws_apigatewayv2_*` | `…-dev` | HTTP API, `POST /orders` e `GET /status`, throttling 5 rps |
+| `aws_iam_role` ×3 + `policy` ×3 | `…-{worker,producer,status}-role` | ver [Segurança](#segurança) |
+| `aws_cloudwatch_log_group` ×3 | `/aws/lambda/…` | retenção 7 dias, removidos no `destroy` |
+| `aws_s3_bucket` + CloudFront | `…-dashboard-<conta>` | bucket **privado**, servido só via Origin Access Control |
+| `random_password` | — | chave de API, 40 caracteres |
 
-### Contrato da mensagem
+## Segurança
 
-```json
-{"a": 1, "b": -5, "c": 6}
-```
+### Nada de credencial no repositório
 
-A validação é estrita: o corpo é JSON, então número chega como número — uma
-string `"1"` no lugar de `1` é recusada, porque aceitá-la esconderia um producer
-com defeito. `a = 0`, valores não finitos e coeficientes que estouram o ponto
-flutuante também são recusados, pelas regras do próprio `calculator.py`.
+O `.gitignore` cobre `*.tfstate*`, `*.tfvars`, `.terraform/`, `.env` e `*.zip`.
+As credenciais AWS vêm do ambiente. A chave de API é gerada pelo Terraform, vive
+no state (não versionado) e sai por `terraform output -raw api_key`.
 
-**Mensagens inválidas são registradas e descartadas neste ciclo** — a DLQ que
-lhes dará destino entra no Ciclo 3. Ver [`docs/cycle-02.md`](docs/cycle-02.md).
+O `.terraform.lock.hcl` **é** versionado, de propósito — é o que faz um clone
+limpo resolver exatamente as mesmas versões de provider. Ele traz hashes para
+Linux, macOS (Intel e ARM) e Windows.
 
-## Decisões de infraestrutura
+### IAM: três papéis, nenhum com permissão do outro
 
-**Fila Standard, não FIFO.** O que este projeto demonstra é paralelismo e vazão,
-e a ordem entre equações independentes não significa nada. FIFO limitaria a 300
-mensagens/s por grupo e encareceria sem benefício.
+Políticas inline com ARN restrito, em vez das managed policies
+(`AWSLambdaBasicExecutionRole` e `AWSLambdaSQSQueueExecutionRole` concedem
+acesso sobre `"*"` — todos os log groups e todas as filas da conta).
 
-**`ReportBatchItemFailures` desde o Ciclo 1.** O handler devolve
-`{"batchItemFailures": []}` mesmo sem ter o que falhar ainda. Sem esse contrato,
-no Ciclo 3 uma única mensagem ruim faria o lote inteiro (até 10) ser reentregue
-e ir para a DLQ junto — inclusive as que já tinham sido processadas com sucesso.
-Adotar depois significaria reescrever handler e testes.
+| | `orders` | `results` | DLQ | Logs |
+| --- | --- | --- | --- | --- |
+| **worker** | Receive, Delete, GetAttributes | Send | Send | escreve no próprio |
+| **producer** | **Send** | — | — | escreve no próprio |
+| **status** | GetAttributes | GetAttributes | GetAttributes, **Receive** | escreve no próprio; **lê o do worker** |
 
-**Dois caminhos de falha, deliberadamente diferentes.** Um erro **permanente**
-(JSON malformado, coeficiente ausente, `a = 0`, overflow) faz o worker publicar
-direto na DLQ e confirmar a mensagem: reentregar três vezes algo que nunca vai
-funcionar só gastaria invocações e atrasaria a chegada na DLQ — e, de quebra, a
-mensagem chega lá com o **motivo da recusa anexado**, coisa que o redrive nativo
-não faz. Um erro **inesperado** (falha ao publicar, indisponibilidade) volta em
-`batchItemFailures` e a SQS reentrega até `maxReceiveCount` antes de mover para
-a DLQ. Ver [`docs/cycle-03.md`](docs/cycle-03.md).
+As roles são espelhadas: o producer publica na `orders` e não consome dela; o
+worker consome e não publica nela. O status é o único que toca as três filas — e
+o único **sem nenhum verbo de escrita em fila**: ele consegue olhar a DLQ, nunca
+esvaziá-la (não tem `DeleteMessage`).
 
-**Visibility timeout de 60 s = 6× o timeout da função.** Recomendação da AWS:
-evita que um retry do lote concorra com a execução ainda em andamento. Como o
-visibility timeout também é o intervalo entre tentativas, o timeout da função
-foi baixado de 30 s para 10 s — o worker processa um lote de 10 em ~20 ms, e o
-valor menor faz o ciclo até a DLQ levar ~2 min em vez de ~6, o que torna a
-demonstração viável.
+Nenhuma policy tem `"Resource": "*"`.
 
-**Retenção de 4 dias nas filas, 14 dias na DLQ.** Uma mensagem na DLQ é um
-problema a investigar, e o tempo de investigar costuma ser bem maior que o tempo
-de processar. (Nos Ciclos 1 e 2 a `orders` usava 4 horas, para limitar o loop de
-reentrega enquanto não havia DLQ; com `maxReceiveCount` o loop tem fim.)
+### O endpoint que gera carga
 
-**Política IAM inline em vez das managed policies.**
-`AWSLambdaBasicExecutionRole` e `AWSLambdaSQSQueueExecutionRole` concedem acesso
-sobre `"*"` — todos os log groups e todas as filas da conta. A inline aponta para
-os recursos exatos, e separa consumo de publicação: o worker consome **apenas**
-da `orders` e publica **apenas** em `results` e na DLQ. Ele não tem
-`sqs:SendMessage` na `orders` (quem publica ali é o producer do Ciclo 4, com role
-própria) nem `ReceiveMessage` nas filas de saída.
+`POST /orders` transforma uma requisição em até 5.000 mensagens. Um endpoint
+aberto seria um gerador de custo para quem o encontrasse. Três camadas:
 
-**Log group declarado no Terraform.** Se não for declarado, quem o cria é a
-própria Lambda no primeiro invoke — fora do state, sem retenção, e sobrevivendo
-ao `terraform destroy`. Declarado, o destroy sai limpo.
+1. **Chave de API** no header `x-api-key`, comparada com `hmac.compare_digest`
+   para que o tempo não revele quantos caracteres iniciais estão corretos, e
+   checada **antes do corpo** — responder `400` a um corpo inválido diria ao
+   chamador anônimo que a chave estava certa. **Falha fechada**: sem chave
+   configurada, nada passa.
+2. **Throttling do stage**: 5 rps, burst 10.
+3. **Teto de 5.000** mensagens por requisição.
 
-**Sem concorrência reservada.** Esta conta tem limite total de 10 execuções
-concorrentes (padrão da AWS para contas novas) e a AWS recusa qualquer reserva
-que derrube a concorrência não reservada abaixo de 10 — inviabilizando até uma
-reserva de 1. Na prática o teto de 10 da conta já cumpre o papel: limita o
-estrago de um bug no producer e mantém a fila acumulando de forma visível na
-demonstração.
+O HTTP API não tem API key nativa (é recurso do REST API v1). A alternativa no
+gateway seria um Lambda authorizer — uma função, uma role e um log group a mais
+para comparar duas strings. Verificar no producer resolve o problema real: uma
+requisição sem chave gera **zero mensagens**.
 
-**State local.** Adequado a um operador só, sem pipeline. `terraform.tfstate`
-está no `.gitignore` porque guarda ARNs e o ID da conta. O backend S3 está
-comentado em `versions.tf` para quando houver CI/CD.
+### O painel
+
+- **Bucket privado.** Acesso só via Origin Access Control, e a bucket policy
+  exige `AWS:SourceArn` igual ao ARN desta distribuição — sem isso, qualquer
+  distribuição CloudFront de qualquer conta poderia ler o bucket. Acesso direto
+  ao S3 devolve `AccessDenied`.
+- **HTTPS obrigatório** (`redirect-to-https`).
+- **A chave não está no bundle.** O `config.js` leva apenas a URL da API.
+- **CORS restrito** à distribuição do painel, não `"*"`.
+- **Cabeçalhos de segurança**: CSP (`default-src 'none'`, sem `unsafe-inline`),
+  HSTS com um ano, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer`.
+
+### Criptografia em repouso
+
+As três filas usam SSE gerenciado pela SQS; o bucket usa AES256. Sem KMS: uma
+CMK só se justificaria com exigência de rotação ou de política de chave própria.
 
 ## Custos
 
-Nenhum recurso tem cobrança fixa — só por uso, e o uso deste projeto cabe
-folgado no free tier permanente da AWS:
+**Nenhum recurso tem cobrança fixa.** Uma demonstração de 1.000 mensagens
+consome:
 
-| Serviço | Free tier mensal | Uma demo de 1.000 mensagens |
-| --- | --- | --- |
-| SQS | 1M requests | ~3.000 requests (send + receive + delete) — **0,3%** |
-| Lambda | 1M invocações + 400k GB-s | ~100 invocações × 128 MB × ~50 ms — **~0,0002%** |
-| CloudWatch Logs | 5 GB de ingestão | ~200 KB — **0,004%** |
+| Serviço | Free tier mensal | Uso de uma demo | Fração |
+| --- | --- | --- | --- |
+| SQS | 1M requests | ~3.000 requests | 0,3% |
+| Lambda | 1M invocações + 400k GB-s | ~110 invocações | ~0,0002% |
+| CloudWatch Logs | 5 GB de ingestão | ~400 KB | 0,008% |
+| S3 | 5 GB | ~25 KB | desprezível |
+| CloudFront | 1 TB + 10M requests | alguns KB | desprezível |
 
-Ainda assim, o hábito recomendado é destruir ao fim de cada sessão de trabalho.
+Rodando a demonstração dezenas de vezes, a fatura fica em **zero** dentro do
+free tier. Ainda assim, o hábito recomendado é destruir ao fim de cada sessão.
 
 ## Limpeza
 
@@ -430,16 +441,95 @@ cd infra
 terraform destroy
 ```
 
-Remove os seis recursos, log group incluído — não fica resíduo na conta.
+Remove os 37 recursos, log groups incluídos — não fica resíduo na conta. Leva
+**cerca de 5 minutos**: a distribuição CloudFront precisa ser desabilitada antes
+de ser removida, e isso é o mais demorado.
+
 Para conferir:
 
 ```bash
 aws sqs list-queues
-aws lambda list-functions --query "Functions[?starts_with(FunctionName, 'bhaskara-events')]"
+aws lambda list-functions --query "Functions[?starts_with(FunctionName,'bhaskara-events')]"
+aws logs describe-log-groups --log-group-name-prefix /aws/lambda/bhaskara-events
 ```
 
-## Segurança
+O `force_destroy = true` no bucket faz o `destroy` remover os objetos junto —
+sem ele, o bucket não vazio bloquearia a remoção.
 
-Nada de credencial no repositório. As credenciais AWS vêm do ambiente
-(`aws configure` ou variáveis de ambiente), e o `.gitignore` cobre
-`*.tfstate*`, `*.tfvars`, `.terraform/`, `.env` e `*.zip`.
+## Limitações conhecidas
+
+**Concorrência da conta em 10.** Esta conta AWS tem o limite padrão de contas
+novas: 10 execuções Lambda simultâneas **no total**, divididas entre worker,
+producer e status. Duas consequências:
+
+- Nenhum valor de `reserved_concurrent_executions` é aceitável (a AWS recusa
+  qualquer reserva que derrube a concorrência não reservada abaixo de 10), então
+  as três funções ficam sem reserva.
+- Sob carga, a função de status pode ser throttled e o painel recebe `503`. Ele
+  trata isso: três tentativas com recuo exponencial e aviso discreto em vez de
+  erro. Para elevar o limite: **Service Quotas → Lambda → Concurrent
+  executions**.
+
+**A chave de API vive numa variável de ambiente** da Lambda, o que a expõe a
+quem tenha `lambda:GetFunctionConfiguration` na conta. Para um laboratório é
+adequado. Um sistema real usaria o Secrets Manager — ao custo de ~US$ 0,40/mês
+por segredo, uma chamada de API no cold start e uma permissão a mais em duas
+roles. Fica registrado como decisão consciente, não como esquecimento.
+
+**Contadores aproximados.** `ApproximateNumberOfMessages` é literal: os valores
+são eventualmente consistentes e podem oscilar poucas unidades entre leituras. O
+contador da DLQ atualiza mais devagar que o da `results`, então no fim de uma
+carga a barra fica alguns segundos parada — o painel diz *"fila vazia,
+contadores ainda assentando"* em vez de deixar parecer que travou.
+
+**Eventos com alguns segundos de atraso.** O fluxo vem do CloudWatch Logs, que
+leva alguns segundos para tornar uma linha consultável. É o que separa
+"praticamente em tempo real" de "tempo real", e um WebSocket não eliminaria essa
+defasagem.
+
+**State local.** Adequado a um operador só, sem pipeline. O backend S3 está
+comentado em `versions.tf` para quando houver CI/CD.
+
+## Decisões de arquitetura
+
+| Decisão | Por quê |
+| --- | --- |
+| Fila **Standard**, não FIFO | o projeto demonstra paralelismo e vazão; a ordem entre equações independentes não significa nada, e FIFO limitaria a 300 msg/s por grupo |
+| `ReportBatchItemFailures` **desde o Ciclo 1** | sem esse contrato, uma única mensagem ruim faria o lote inteiro (até 10) ir para a DLQ, inclusive as já processadas com sucesso |
+| Erro permanente vai **direto** para a DLQ | reentregar 3× algo que nunca vai funcionar gasta invocações e atrasa a chegada na DLQ; e o worker anexa o motivo, coisa que o redrive nativo não faz |
+| Timeout do worker em **10 s** | o visibility timeout é derivado dele (6×, recomendação AWS) e também é o intervalo entre tentativas: 60 s em vez de 180 s faz o ciclo até a DLQ levar ~2 min em vez de ~6 |
+| **256 MB** no producer, 128 MB nos demais | na Lambda a CPU é proporcional à memória; o producer faz centenas de chamadas de rede e termina antes, podendo custar o mesmo ou menos |
+| Contadores da **profundidade das filas**, não DynamoDB | nada consome `results` nem a DLQ, então elas **já são** o contador; agregar custaria mais um componente e uma escrita por mensagem |
+| **Polling**, não WebSocket | o fluxo vem do CloudWatch Logs, que já tem segundos de defasagem; um WebSocket entregaria a mesma informação com o mesmo atraso e muito mais complexidade |
+| Equações **construídas a partir do desfecho** | sortear `a`, `b`, `c` ao acaso quase nunca produz `delta = 0`, que exige `b² == 4ac` exato |
+| Log em **JSON**, não texto | a validação compara campos e o painel os lê; texto livre exigiria parser |
+| Chave de API verificada **no producer** | o HTTP API não tem API key nativa; um Lambda authorizer custaria função, role e log group para comparar duas strings |
+
+Duas dependências circulares apareceram no Terraform e foram quebradas montando
+o valor a mão em vez de referenciar o recurso:
+
+- `orders` aponta para a DLQ no `redrive_policy`, e a DLQ precisa apontar de
+  volta no `redrive_allow_policy` → o ARN da `orders` é montado a partir do nome.
+- A CSP nomearia a API, a API aponta para a distribuição no CORS e a
+  distribuição aponta para a policy da CSP → o `connect-src` usa um curinga
+  restrito à região.
+
+## Histórico de desenvolvimento
+
+Sete ciclos, cada um em um estado funcional e testável, documentado em
+[`docs/`](docs/):
+
+| Ciclo | Entrega | Nota |
+| --- | --- | --- |
+| 1 | Fila `orders`, worker, event source mapping, IAM, logs | [cycle-01](docs/cycle-01.md) |
+| 2 | Worker resolve a equação com `calculator.py` | [cycle-02](docs/cycle-02.md) |
+| 3 | Fila `results`, DLQ, retry, tratamento de erro | [cycle-03](docs/cycle-03.md) |
+| 4 | Producer: N mensagens por requisição | [cycle-04](docs/cycle-04.md) |
+| 5 | `GET /status` com as métricas | [cycle-05](docs/cycle-05.md) |
+| 6 | Painel web | [cycle-06](docs/cycle-06.md) |
+| 7 | Polimento e entrega | [cycle-07](docs/cycle-07.md) |
+
+As notas de ciclo registram também o que **deu errado** — o limite de
+concorrência que inviabilizou a reserva no Ciclo 1, o cursor de eventos travado
+em zero que o teste E2E encontrou no Ciclo 6, e o contador da DLQ que parecia
+travado mas só estava lento.

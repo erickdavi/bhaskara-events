@@ -60,6 +60,63 @@ resource "aws_cloudfront_cache_policy" "dashboard" {
   }
 }
 
+# Cabecalhos de seguranca. A pagina manuseia uma chave de API no localStorage,
+# entao vale fechar as portas classicas do lado do browser.
+#
+# A CSP e restritiva porque a pagina permite: todo o CSS e JS vem do proprio
+# bucket, nao ha inline script, e a unica origem externa contactada e o API
+# Gateway — nomeado em connect-src em vez de liberar "*".
+resource "aws_cloudfront_response_headers_policy" "dashboard" {
+  name = "${local.name_prefix}-dashboard"
+
+  security_headers_config {
+    content_type_options {
+      override = true
+    }
+
+    frame_options {
+      frame_option = "DENY"
+      override     = true
+    }
+
+    referrer_policy {
+      referrer_policy = "no-referrer"
+      override        = true
+    }
+
+    strict_transport_security {
+      access_control_max_age_sec = 31536000
+      include_subdomains         = true
+      override                   = true
+    }
+
+    content_security_policy {
+      override = true
+      content_security_policy = join("; ", [
+        "default-src 'none'",
+        "script-src 'self'",
+        "style-src 'self'",
+        "img-src 'self' data:",
+        # Curinga dentro da regiao, e nao a URL exata da API.
+        #
+        # Nomear a API aqui fecharia um ciclo no grafo do Terraform: a CSP
+        # apontaria para a API, a API aponta para a distribuicao no CORS
+        # (Ciclo 6) e a distribuicao aponta para esta policy. O ID da API e o
+        # da distribuicao so existem depois de criados, entao nao ha lado do
+        # ciclo que possa ser resolvido a mao.
+        #
+        # O curinga restringe a chamadas ao API Gateway desta regiao. E menos
+        # preciso que a URL exata, mas continua muito mais fechado que "*" — e
+        # a autorizacao real e a chave de API, nao a CSP.
+        "connect-src https://*.execute-api.${var.aws_region}.amazonaws.com",
+        "base-uri 'none'",
+        "form-action 'none'",
+        "frame-ancestors 'none'",
+      ])
+    }
+  }
+}
+
 resource "aws_cloudfront_distribution" "dashboard" {
   enabled             = true
   default_root_object = "index.html"
@@ -85,7 +142,8 @@ resource "aws_cloudfront_distribution" "dashboard" {
     viewer_protocol_policy = "redirect-to-https"
     compress               = true
 
-    cache_policy_id = aws_cloudfront_cache_policy.dashboard.id
+    cache_policy_id            = aws_cloudfront_cache_policy.dashboard.id
+    response_headers_policy_id = aws_cloudfront_response_headers_policy.dashboard.id
   }
 
   restrictions {

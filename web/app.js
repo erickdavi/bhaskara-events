@@ -240,7 +240,7 @@
   // entao a subtracao acontece aqui. Sem baseline, mostra o acumulado mesmo.
   function relative(data) {
     if (!state.baseline) {
-      return { succeeded: data.succeeded, failed: data.failed, scoped: false };
+      return { succeeded: data.succeeded, failed: data.failed };
     }
 
     // A baseline se auto-corrige. Os contadores da SQS sao eventualmente
@@ -257,8 +257,7 @@
 
     return {
       succeeded: data.succeeded - state.baseline.succeeded,
-      failed: data.failed - state.baseline.failed,
-      scoped: true
+      failed: data.failed - state.baseline.failed
     };
   }
 

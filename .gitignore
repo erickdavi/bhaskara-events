@@ -59,9 +59,12 @@ Thumbs.db
 #
 # O state guarda ARNs, IDs de conta e atributos de recurso — nao vai para o Git.
 # Os tfvars podem conter valores especificos do ambiente de quem aplica.
+#
+# .terraform.lock.hcl NAO esta aqui de proposito: ele e versionado. E o que faz
+# um clone limpo resolver exatamente as mesmas versoes de provider, em vez de
+# pegar o que estiver publicado no dia.
 
 .terraform/
-.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfvars

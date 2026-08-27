@@ -229,3 +229,15 @@ svg { display: block; width: 100%; height: auto; }
 
 .foot { margin-top: 26px; font-size: 12px; color: var(--text-muted); }
 .foot code { font-family: var(--mono); }
+
+/* Utilitarios de espacamento.
+   Existem porque a CSP servida pelo CloudFront usa style-src 'self': atributos
+   style= no HTML sao bloqueados pelo browser, entao todo estilo mora aqui. */
+.card--spaced { margin-bottom: 18px; }
+.card--top    { margin-top: 18px; }
+.flush        { margin: 0; }
+.hint         { color: var(--text-muted); }
+
+/* As barras comecam vazias; a largura passa a ser escrita pelo JS via CSSOM,
+   que a CSP permite (ao contrario do atributo style=). */
+.meter span { width: 0; }
