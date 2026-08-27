@@ -149,8 +149,8 @@ CloudWatch Logs, não defeitos. O painel trata as duas explicitamente.
 | 1 | Terraform sem variável órfã, sem `Resource: "*"` | ✅ |
 | 2 | IAM revisado e documentado | ✅ matriz das três roles no README |
 | 3 | Testes passando, sem instabilidade | ✅ `145 passed`, 30 execuções seguidas sem falha |
-| 4 | README permite reprodução de clone limpo | ✅ ver abaixo |
+| 4 | README permite reprodução de clone limpo | ✅ clone do GitHub: `145 passed` + `terraform validate` OK |
 | 5 | `.gitignore` correto, lock versionado | ✅ |
 | 6 | Segurança revisada | ✅ CSP, HSTS, CORS, IAM, bucket privado |
 | 7 | Custos documentados | ✅ tabela contra o free tier |
-| 8 | `destroy` limpo, sem resíduo | ✅ (critério pendente desde o Ciclo 1) |
+| 8 | `destroy` limpo, sem resíduo | ⏸️ **não executado** — a stack foi mantida no ar. É o único critério ainda em aberto, pendente desde o Ciclo 1. |
