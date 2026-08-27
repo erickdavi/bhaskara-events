@@ -4,12 +4,13 @@ Arquitetura orientada a eventos (event-driven) para cálculo de equações do
 segundo grau na AWS, com filas SQS, Lambdas assíncronas e infraestrutura
 declarada em Terraform.
 
-> **Estado atual: Ciclo 2 concluído — Bhaskara event-driven.**
+> **Estado atual: Ciclo 3 concluído — output e DLQ.**
 >
-> A fila `orders` e o worker Lambda estão no ar: uma mensagem
-> `{"a": 1, "b": -5, "c": 6}` publicada na fila é resolvida de forma assíncrona
-> e o resultado aparece no CloudWatch. Ainda não há fila `results` nem DLQ —
-> elas entram no Ciclo 3.
+> O fluxo `orders → worker → results` está completo, com dead letter queue e
+> retry. Uma mensagem `{"a": 1, "b": -5, "c": 6}` publicada na `orders` é
+> resolvida de forma assíncrona e o resultado aparece na `results`; uma
+> mensagem inválida vai para a DLQ com o motivo anexado. Ainda não há producer
+> nem API — eles entram no Ciclo 4.
 
 Este é o **Checkpoint 2** de um trabalho em duas partes. O Checkpoint 1 é uma
 API serverless síncrona (`API Gateway → Lambda → resposta HTTP`) que vive em
@@ -51,7 +52,7 @@ Destino do projeto, ao fim dos 7 ciclos:
                  └─────────────┘  └────────────────┘
 ```
 
-O que existe **hoje**, no Ciclo 2:
+O que existe **hoje**, no Ciclo 3:
 
 ```text
    aws sqs send-message
@@ -60,18 +61,22 @@ O que existe **hoje**, no Ciclo 2:
             ▼
     ┌───────────────┐     event source      ┌────────────────┐
     │  SQS orders   │───────mapping────────►│ Worker Lambda  │
-    └───────────────┘                       │  calculate()   │
-                                            └───────┬────────┘
-                                                    │
-                                    ┌───────────────┴───────────────┐
-                                    ▼                               ▼
-                          message_processed               message_rejected
-                          delta, x1, x2                   reason
-                                    └───────────────┬───────────────┘
-                                                    ▼
-                                          ┌──────────────────┐
-                                          │ CloudWatch Logs  │
-                                          └──────────────────┘
+    └───────┬───────┘                       │  calculate()   │
+            │                               └───┬────────┬───┘
+            │ redrive_policy                    │        │
+            │ maxReceiveCount = 3       sucesso │        │ inválida
+            │                                   ▼        │
+            │                          ┌─────────────┐   │
+            │                          │ SQS results │   │
+            │                          └─────────────┘   │
+            │                                            │
+            │  falha inesperada ──► batchItemFailures    │
+            │         └── retry ──┘                      │
+            ▼                                            ▼
+    ┌──────────────────────────────────────────────────────┐
+    │                  SQS orders-dlq                      │
+    │   (mensagem inválida chega com RejectionReason)      │
+    └──────────────────────────────────────────────────────┘
 ```
 
 ### Desenvolvimento incremental
@@ -80,7 +85,7 @@ O que existe **hoje**, no Ciclo 2:
 | --- | --- | --- |
 | 1 | Infraestrutura de mensageria: SQS orders, worker Lambda, event source mapping, IAM, logs | ✅ concluído |
 | 2 | Bhaskara event-driven: worker passa a calcular usando `calculator.py` | ✅ concluído |
-| 3 | Output e DLQ: fila `results`, DLQ, retry, tratamento de erro | ⬜ |
+| 3 | Output e DLQ: fila `results`, DLQ, retry, tratamento de erro | ✅ concluído |
 | 4 | Producer: gerar N mensagens a partir de uma única requisição | ⬜ |
 | 5 | API de status: métricas do processamento | ⬜ |
 | 6 | Web dashboard: disparar a carga e acompanhar visualmente | ⬜ |
@@ -104,10 +109,10 @@ bhaskara-events/
 │           └── handler.py      # consome a fila orders
 ├── tests/
 │   ├── test_calculator.py      # 18 casos, herdados do Checkpoint 1
-│   └── test_worker_handler.py  # 33 casos, contrato com a SQS e o cálculo
+│   └── test_worker_handler.py  # 45 casos, contrato com a SQS, cálculo e falhas
 ├── infra/                      # Terraform
 │   ├── versions.tf  main.tf  variables.tf  outputs.tf
-│   ├── sqs.tf                  # fila orders
+│   ├── sqs.tf                  # filas orders, results e DLQ
 │   ├── iam.tf                  # role e política do worker
 │   └── worker.tf               # Lambda, log group, event source mapping
 ├── scripts/
@@ -139,7 +144,7 @@ Não precisa de credenciais AWS — os testes são todos locais.
 ```
 
 ```text
-51 passed
+63 passed
 ```
 
 Manualmente:
@@ -169,12 +174,14 @@ terraform output -raw send_test_message
 terraform output -raw tail_worker_logs
 ```
 
-### Recursos criados (Ciclo 1)
+### Recursos criados
 
 | Recurso | Nome | Observação |
 | --- | --- | --- |
-| `aws_sqs_queue` | `bhaskara-events-dev-orders` | Standard, visibility 180 s, retenção 4 h, long polling 20 s, SSE gerenciado pela SQS |
-| `aws_lambda_function` | `bhaskara-events-dev-worker` | Python 3.13, arm64, 128 MB, timeout 30 s |
+| `aws_sqs_queue` | `bhaskara-events-dev-orders` | entrada; visibility 60 s, retenção 4 dias, long polling 20 s, SSE, redrive para a DLQ após 3 entregas |
+| `aws_sqs_queue` | `bhaskara-events-dev-results` | saída; mesmos parâmetros |
+| `aws_sqs_queue` | `bhaskara-events-dev-orders-dlq` | dead letter queue; retenção 14 dias |
+| `aws_lambda_function` | `bhaskara-events-dev-worker` | Python 3.13, arm64, 128 MB, timeout 10 s |
 | `aws_lambda_event_source_mapping` | — | batch 10, janela 0 s, `ReportBatchItemFailures` |
 | `aws_iam_role` + `aws_iam_role_policy` | `bhaskara-events-dev-worker-role` | ARN restrito, sem `Resource: "*"` |
 | `aws_cloudwatch_log_group` | `/aws/lambda/bhaskara-events-dev-worker` | retenção 7 dias, removido no `destroy` |
@@ -235,18 +242,34 @@ no Ciclo 3 uma única mensagem ruim faria o lote inteiro (até 10) ser reentregu
 e ir para a DLQ junto — inclusive as que já tinham sido processadas com sucesso.
 Adotar depois significaria reescrever handler e testes.
 
-**Visibility timeout de 180 s = 6× o timeout da função.** Recomendação da AWS:
-evita que um retry do lote concorra com a execução ainda em andamento.
+**Dois caminhos de falha, deliberadamente diferentes.** Um erro **permanente**
+(JSON malformado, coeficiente ausente, `a = 0`, overflow) faz o worker publicar
+direto na DLQ e confirmar a mensagem: reentregar três vezes algo que nunca vai
+funcionar só gastaria invocações e atrasaria a chegada na DLQ — e, de quebra, a
+mensagem chega lá com o **motivo da recusa anexado**, coisa que o redrive nativo
+não faz. Um erro **inesperado** (falha ao publicar, indisponibilidade) volta em
+`batchItemFailures` e a SQS reentrega até `maxReceiveCount` antes de mover para
+a DLQ. Ver [`docs/cycle-03.md`](docs/cycle-03.md).
 
-**Retenção de 4 horas na fila, deliberadamente baixa.** Enquanto não existir DLQ
-(Ciclo 3), uma mensagem que falhe sempre é reentregue até expirar. A retenção
-curta limita essa janela. Volta para o padrão de 4 dias quando a DLQ entrar.
+**Visibility timeout de 60 s = 6× o timeout da função.** Recomendação da AWS:
+evita que um retry do lote concorra com a execução ainda em andamento. Como o
+visibility timeout também é o intervalo entre tentativas, o timeout da função
+foi baixado de 30 s para 10 s — o worker processa um lote de 10 em ~20 ms, e o
+valor menor faz o ciclo até a DLQ levar ~2 min em vez de ~6, o que torna a
+demonstração viável.
+
+**Retenção de 4 dias nas filas, 14 dias na DLQ.** Uma mensagem na DLQ é um
+problema a investigar, e o tempo de investigar costuma ser bem maior que o tempo
+de processar. (Nos Ciclos 1 e 2 a `orders` usava 4 horas, para limitar o loop de
+reentrega enquanto não havia DLQ; com `maxReceiveCount` o loop tem fim.)
 
 **Política IAM inline em vez das managed policies.**
 `AWSLambdaBasicExecutionRole` e `AWSLambdaSQSQueueExecutionRole` concedem acesso
 sobre `"*"` — todos os log groups e todas as filas da conta. A inline aponta para
-o log group e a fila exatos. O worker também **não** tem `sqs:SendMessage`: ele
-consome, não publica.
+os recursos exatos, e separa consumo de publicação: o worker consome **apenas**
+da `orders` e publica **apenas** em `results` e na DLQ. Ele não tem
+`sqs:SendMessage` na `orders` (quem publica ali é o producer do Ciclo 4, com role
+própria) nem `ReceiveMessage` nas filas de saída.
 
 **Log group declarado no Terraform.** Se não for declarado, quem o cria é a
 própria Lambda no primeiro invoke — fora do state, sem retenção, e sobrevivendo

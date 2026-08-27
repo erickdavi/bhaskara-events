@@ -40,9 +40,18 @@ variable "worker_memory_size" {
 }
 
 variable "worker_timeout" {
-  description = "Timeout do worker em segundos. Precisa cobrir o lote inteiro (batch_size mensagens), nao uma mensagem so."
+  description = <<-EOT
+    Timeout do worker em segundos. Precisa cobrir o lote inteiro (batch_size
+    mensagens), nao uma mensagem so.
+
+    10 s com folga enorme: um lote de 10 equacoes leva ~20 ms mais o cold start
+    de ~85 ms. O valor baixo tem proposito — o visibility timeout da fila e
+    derivado dele (6x, recomendacao da AWS), e um visibility menor faz o ciclo
+    de retry ate a DLQ levar ~2 minutos em vez de ~6, o que torna a
+    demonstracao viavel.
+  EOT
   type        = number
-  default     = 30
+  default     = 10
 }
 
 variable "worker_reserved_concurrency" {
@@ -78,21 +87,54 @@ variable "worker_batch_size" {
 }
 
 variable "queue_visibility_timeout" {
-  description = "Tempo que a mensagem fica invisivel apos ser entregue. A AWS recomenda no minimo 6x o timeout da funcao consumidora, para que um retry do lote nao concorra com a execucao ainda em andamento."
+  description = "Tempo que a mensagem fica invisivel apos ser entregue. A AWS recomenda no minimo 6x o timeout da funcao consumidora, para que um retry do lote nao concorra com a execucao ainda em andamento. Tambem e o intervalo entre as tentativas de retry."
   type        = number
-  default     = 180
+  default     = 60
 }
 
 variable "queue_message_retention" {
   description = <<-EOT
-    Retencao das mensagens na fila, em segundos.
+    Retencao das mensagens nas filas orders e results, em segundos.
 
-    4 horas, deliberadamente baixo. Enquanto nao existir DLQ (Ciclo 3), uma
-    mensagem que falhe sempre e reentregue ate expirar — a retencao curta
-    limita essa janela. Volta para o padrao de 4 dias quando a DLQ entrar.
+    4 dias, o padrao da SQS. Nos Ciclos 1 e 2 este valor era 4 horas para
+    limitar a janela de reentrega de uma mensagem que falhasse sempre — sem
+    DLQ, ela ficaria em loop ate expirar. Com a DLQ no lugar, o loop tem fim
+    (maxReceiveCount) e a retencao curta perdeu a razao de existir.
   EOT
   type        = number
-  default     = 14400
+  default     = 345600
+}
+
+variable "dlq_message_retention" {
+  description = <<-EOT
+    Retencao da dead letter queue, em segundos.
+
+    14 dias, o maximo da SQS, contra os 4 dias das demais filas. Uma mensagem
+    na DLQ e um problema a investigar, e o tempo de investigar costuma ser
+    bem maior que o tempo de processar.
+  EOT
+  type        = number
+  default     = 1209600
+}
+
+variable "max_receive_count" {
+  description = <<-EOT
+    Quantas entregas sem confirmacao a SQS tolera antes de mover a mensagem
+    para a DLQ.
+
+    3 = a entrega original mais duas tentativas. Vale apenas para falhas
+    inesperadas, que o worker devolve em batchItemFailures: uma
+    indisponibilidade momentanea costuma passar em segundos, e mais tentativas
+    so atrasariam o diagnostico. Mensagens invalidas nao passam por aqui — vao
+    direto para a DLQ, porque reentregar nao mudaria o desfecho.
+  EOT
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.max_receive_count >= 1
+    error_message = "max_receive_count deve ser no minimo 1."
+  }
 }
 
 variable "queue_receive_wait_time" {
@@ -111,4 +153,26 @@ variable "tags" {
   description = "Tags adicionais aplicadas a todos os recursos."
   type        = map(string)
   default     = {}
+}
+
+variable "simulate_publish_failure" {
+  description = <<-EOT
+    Aponta RESULTS_QUEUE_URL para uma fila inexistente, fazendo toda publicacao
+    de resultado falhar.
+
+    Existe para tornar demonstravel o caminho de retry nativo, que por
+    definicao so aparece quando algo da errado de forma inesperada — e o
+    codigo, quando funciona, nao da errado. Com o interruptor ligado, uma
+    mensagem valida falha ao publicar, volta em batchItemFailures, e a SQS a
+    reentrega ate maxReceiveCount antes de move-la para a DLQ pelo
+    redrive_policy.
+
+    Nao e chaos engineering embutido no caminho de producao: nenhuma linha do
+    handler sabe que este interruptor existe. O que muda e apenas o valor de
+    uma variavel de ambiente.
+
+    Sempre false fora da demonstracao.
+  EOT
+  type        = bool
+  default     = false
 }

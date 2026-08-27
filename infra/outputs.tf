@@ -20,10 +20,30 @@ output "worker_log_group" {
 
 output "send_test_message" {
   description = "Comando pronto para validar o ciclo: publica uma mensagem na fila orders."
-  value       = "aws sqs send-message --queue-url ${aws_sqs_queue.orders.url} --message-body '{\"ping\":\"cycle-1\"}'"
+  value       = "aws sqs send-message --queue-url ${aws_sqs_queue.orders.url} --message-body '{\"a\":1,\"b\":-5,\"c\":6}'"
 }
 
 output "tail_worker_logs" {
   description = "Comando pronto para acompanhar o processamento em tempo real."
   value       = "aws logs tail ${aws_cloudwatch_log_group.worker.name} --follow --format short"
+}
+
+output "results_queue_url" {
+  description = "URL da fila results, onde os calculos bem-sucedidos sao publicados."
+  value       = aws_sqs_queue.results.url
+}
+
+output "dlq_queue_url" {
+  description = "URL da dead letter queue."
+  value       = aws_sqs_queue.orders_dlq.url
+}
+
+output "read_results" {
+  description = "Comando pronto para ler um resultado da fila results."
+  value       = "aws sqs receive-message --queue-url ${aws_sqs_queue.results.url} --max-number-of-messages 10"
+}
+
+output "read_dlq" {
+  description = "Comando pronto para inspecionar a DLQ, com o motivo da recusa."
+  value       = "aws sqs receive-message --queue-url ${aws_sqs_queue.orders_dlq.url} --max-number-of-messages 10 --message-attribute-names All"
 }

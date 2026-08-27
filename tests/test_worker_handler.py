@@ -11,6 +11,7 @@ import json
 import pytest
 
 from calculator import calculate
+from src.handlers.worker import handler as worker
 from src.handlers.worker.handler import lambda_handler
 
 
@@ -318,3 +319,209 @@ def test_calculation_matches_the_business_rule(capsys):
 
     assert outcome["x1"] == expected["x1"]
     assert outcome["x2"] == expected["x2"]
+
+
+# ---------------------------------------------------------------------------
+# Ciclo 3 — publicacao em results, DLQ e retry
+# ---------------------------------------------------------------------------
+
+RESULTS_URL = "https://sqs.local/results"
+DLQ_URL = "https://sqs.local/orders-dlq"
+
+
+class FakeSQS:
+    """Dubles do cliente SQS.
+
+    Registra o que foi publicado e sabe falhar sob demanda numa fila
+    especifica, que e como os testes simulam a falha inesperada — a categoria
+    que deve virar retry em vez de descarte.
+    """
+
+    def __init__(self):
+        self.sent = []
+        self.fail_on = None
+
+    def send_message(self, **request):
+        if self.fail_on and self.fail_on in request["QueueUrl"]:
+            raise RuntimeError("SQS indisponivel")
+
+        self.sent.append(request)
+
+    def to(self, queue_url):
+        return [request for request in self.sent if request["QueueUrl"] == queue_url]
+
+
+@pytest.fixture(autouse=True)
+def sqs(monkeypatch):
+    """Substitui o cliente SQS em todos os testes deste modulo.
+
+    Autouse de proposito: nenhum teste deve tocar a AWS de verdade, e um teste
+    que esquecesse a fixture publicaria na nuvem sem avisar.
+    """
+    client = FakeSQS()
+
+    monkeypatch.setattr(worker, "_sqs", client)
+    monkeypatch.setattr(worker, "RESULTS_QUEUE_URL", RESULTS_URL)
+    monkeypatch.setattr(worker, "DLQ_QUEUE_URL", DLQ_URL)
+
+    return client
+
+
+def test_successful_result_is_published_to_results(sqs, capsys):
+    lambda_handler(
+        {"Records": [sqs_record(message_id="eq-1", body='{"a": 1, "b": -5, "c": 6}')]},
+        FakeContext(),
+    )
+
+    published = sqs.to(RESULTS_URL)
+
+    assert len(published) == 1
+
+    result = json.loads(published[0]["MessageBody"])
+
+    assert result["message_id"] == "eq-1"
+    assert result["delta"] == 1
+    assert (result["x1"], result["x2"]) == (3.0, 2.0)
+
+
+def test_result_without_real_roots_is_also_published(sqs, capsys):
+    lambda_handler({"Records": [sqs_record(body='{"a": 1, "b": 2, "c": 5}')]}, FakeContext())
+
+    result = json.loads(sqs.to(RESULTS_URL)[0]["MessageBody"])
+
+    assert result["roots"] == []
+
+
+def test_invalid_message_goes_to_the_dlq(sqs, capsys):
+    lambda_handler(
+        {"Records": [sqs_record(message_id="bad-1", body='{"a": 0, "b": 5, "c": 10}')]},
+        FakeContext(),
+    )
+
+    assert sqs.to(RESULTS_URL) == []
+
+    dead = sqs.to(DLQ_URL)
+
+    assert len(dead) == 1
+    # O corpo original vai intacto: a DLQ existe para inspecionar e reprocessar
+    # exatamente o que chegou.
+    assert dead[0]["MessageBody"] == '{"a": 0, "b": 5, "c": 10}'
+
+
+def test_dlq_message_carries_the_rejection_reason(sqs, capsys):
+    lambda_handler(
+        {"Records": [sqs_record(message_id="bad-1", body="nao e json")]},
+        FakeContext(),
+    )
+
+    attributes = sqs.to(DLQ_URL)[0]["MessageAttributes"]
+
+    assert "JSON" in attributes["RejectionReason"]["StringValue"]
+    assert attributes["SourceMessageId"]["StringValue"] == "bad-1"
+
+
+def test_permanent_error_is_not_retried(sqs, capsys):
+    # Este e o ponto do caminho permanente: a mensagem foi para a DLQ e a
+    # original e confirmada. Devolve-la em batchItemFailures faria a SQS
+    # reentregar tres vezes algo que nunca vai funcionar.
+    result = lambda_handler(
+        {"Records": [sqs_record(body='{"a": 1, "b": -5}')]},
+        FakeContext(),
+    )
+
+    assert result == {"batchItemFailures": []}
+
+
+def test_unexpected_error_becomes_a_retry(sqs, capsys):
+    # Falha ao publicar em results: pode ser indisponibilidade momentanea, e
+    # reentregar tem chance real de salvar a mensagem.
+    sqs.fail_on = RESULTS_URL
+
+    result = lambda_handler(
+        {"Records": [sqs_record(message_id="eq-1")]},
+        FakeContext(),
+    )
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "eq-1"}]}
+
+    failed = events_of(logged(capsys), "message_failed")[0]
+
+    assert failed["message_id"] == "eq-1"
+    assert failed["error_type"] == "RuntimeError"
+
+
+def test_failing_to_archive_in_the_dlq_becomes_a_retry(sqs, capsys):
+    # Falhar em arquivar nao pode virar perda silenciosa: se a publicacao na
+    # DLQ falha, a mensagem tem de voltar para a fila.
+    sqs.fail_on = DLQ_URL
+
+    result = lambda_handler(
+        {"Records": [sqs_record(message_id="bad-1", body="nao e json")]},
+        FakeContext(),
+    )
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "bad-1"}]}
+
+
+def test_missing_queue_configuration_becomes_a_retry(sqs, capsys, monkeypatch):
+    # Erro de configuracao (variavel de ambiente ausente) nao pode descartar
+    # mensagem: vira retry, e o operador ve message_failed no log.
+    monkeypatch.setattr(worker, "RESULTS_QUEUE_URL", "")
+
+    result = lambda_handler({"Records": [sqs_record(message_id="eq-1")]}, FakeContext())
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "eq-1"}]}
+
+
+def test_the_three_outcomes_coexist_in_one_batch(sqs, capsys):
+    # O caso que justifica o ReportBatchItemFailures: num mesmo lote, uma
+    # mensagem boa e confirmada, uma invalida vai para a DLQ e so a que falhou
+    # de forma inesperada volta para a fila.
+    sqs.fail_on = RESULTS_URL
+
+    records = [
+        sqs_record(message_id="ok-1", body='{"a": 1, "b": -5, "c": 6}'),
+        sqs_record(message_id="bad-1", body="nao e json"),
+    ]
+
+    result = lambda_handler({"Records": records}, FakeContext())
+
+    # A invalida foi arquivada e nao volta.
+    assert len(sqs.to(DLQ_URL)) == 1
+    # A boa falhou ao publicar e volta sozinha.
+    assert result == {"batchItemFailures": [{"itemIdentifier": "ok-1"}]}
+
+
+def test_partial_failure_is_logged(sqs, capsys):
+    sqs.fail_on = RESULTS_URL
+
+    lambda_handler(
+        {"Records": [sqs_record(message_id="eq-1"), sqs_record(message_id="eq-2")]},
+        FakeContext(),
+    )
+
+    summary = events_of(logged(capsys), "batch_partial_failure")[0]
+
+    assert summary["failed"] == 2
+    assert summary["total"] == 2
+
+
+def test_no_partial_failure_event_when_everything_works(sqs, capsys):
+    lambda_handler({"Records": [sqs_record()]}, FakeContext())
+
+    assert events_of(logged(capsys), "batch_partial_failure") == []
+
+
+def test_receive_count_is_visible_for_retried_messages(sqs, capsys):
+    # O receive_count e o que mostra o retry acontecendo, e o que permite
+    # prever quando a mensagem cairá na DLQ pelo redrive_policy.
+    sqs.fail_on = RESULTS_URL
+
+    lambda_handler(
+        {"Records": [sqs_record(message_id="eq-1", receive_count=3)]},
+        FakeContext(),
+    )
+
+    failed = events_of(logged(capsys), "message_failed")[0]
+
+    assert failed["receive_count"] == 3

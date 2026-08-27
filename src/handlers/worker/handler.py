@@ -1,49 +1,58 @@
-"""Worker do fluxo event-driven: consome a fila orders e calcula a equacao.
+"""Worker do fluxo event-driven: consome orders, calcula e publica em results.
 
-Ciclo 2 — o worker passa a interpretar o corpo da mensagem e a resolver a
-equacao com a mesma implementacao usada pelo Checkpoint 1 (calculator.py, sem
-uma linha de alteracao). O caminho SQS -> Lambda em si ja foi provado no
-Ciclo 1 e continua valendo.
+Ciclo 3 — o resultado deixa de existir apenas no log e passa a ser publicado na
+fila results, e as mensagens problematicas ganham destino na DLQ.
 
-Formato esperado do corpo da mensagem:
+    orders ──► worker ──► results
+                 │
+                 └── falha ──► DLQ
 
-    {"a": 1, "b": -5, "c": 6}
+Ha dois caminhos de falha, e eles sao deliberadamente diferentes. A separacao
+vem da classificacao feita no Ciclo 2:
 
-O log sai como uma linha JSON por evento em vez de texto livre: a validacao dos
-ciclos compara campos (messageId, resultado) e o painel do Ciclo 6 vai ler esses
-mesmos campos. Texto livre exigiria parser; JSON o CloudWatch Logs Insights ja
-consulta por campo.
+  permanente   InvalidMessage / ValueError — JSON malformado, coeficiente
+               ausente, a = 0, overflow. Reentregar nao muda o desfecho, entao
+               o worker publica direto na DLQ e confirma a mensagem. Reentregar
+               tres vezes uma mensagem que nunca vai funcionar so gastaria
+               invocacoes e atrasaria em minutos a chegada na DLQ. De quebra, a
+               mensagem chega la com o motivo da recusa anexado — coisa que o
+               redrive nativo nao faz.
 
-Sobre o destino das mensagens invalidas: neste ciclo elas sao registradas como
-message_rejected e descartadas. Nao ha DLQ ainda — ela entra no Ciclo 3, junto
-com o retry. Descartar e provisorio, mas e melhor do que a alternativa
-disponivel hoje: propagar a excecao faria a SQS reentregar o lote inteiro em
-loop ate a retencao de 4h expirar, sem nenhum lugar para a mensagem ruim
-descansar. A classificacao entre erro permanente e erro inesperado, abaixo, e
-justamente o que o Ciclo 3 vai usar para decidir o que vai para a DLQ e o que
-merece nova tentativa.
+  inesperada   qualquer outra excecao: bug, indisponibilidade momentanea da
+               SQS, permissao revogada. Aqui reentregar pode salvar a mensagem,
+               entao o worker devolve o messageId em batchItemFailures e deixa
+               o mecanismo nativo agir — a SQS reentrega ate maxReceiveCount e
+               so entao move para a DLQ pelo redrive_policy.
+
+O log sai como uma linha JSON por evento: a validacao dos ciclos compara campos
+e o painel do Ciclo 6 vai ler esses mesmos campos. Texto livre exigiria parser;
+JSON o CloudWatch Logs Insights ja consulta por campo.
 """
 
 import json
 import math
+import os
 
 from calculator import calculate
 
-# Corpo truncado no log. Em Ciclo 1 e 2 as mensagens sao minusculas, mas o
+# Corpo truncado no log. As mensagens deste projeto sao minusculas, mas o
 # producer do Ciclo 4 gera milhares delas — e ingestao de log e o unico item
-# deste projeto que sai do free tier se alguem publicar payloads grandes.
+# que sai do free tier se alguem publicar payloads grandes.
 MAX_LOGGED_BODY = 512
 
 COEFFICIENTS = ("a", "b", "c")
 
+RESULTS_QUEUE_URL = os.environ.get("RESULTS_QUEUE_URL", "")
+DLQ_QUEUE_URL = os.environ.get("DLQ_QUEUE_URL", "")
+
+# Cliente criado sob demanda, e nao no import, por dois motivos: mantem o cold
+# start fora do caminho de quem so importa o modulo, e permite que os testes
+# substituam este objeto sem precisar do boto3 instalado localmente.
+_sqs = None
+
 
 class InvalidMessage(Exception):
-    """Erro permanente: a mensagem nunca vai funcionar, reentregar nao ajuda.
-
-    Separada de qualquer outra excecao de proposito. No Ciclo 3 esta e a classe
-    que manda a mensagem direto para a DLQ, enquanto uma falha inesperada
-    (bug, indisponibilidade momentanea) merece as tentativas de retry.
-    """
+    """Erro permanente: a mensagem nunca vai funcionar, reentregar nao ajuda."""
 
 
 def lambda_handler(event, context):
@@ -56,40 +65,66 @@ def lambda_handler(event, context):
         batch_size=len(records),
     )
 
+    failures = []
+
     for record in records:
+        message_id = record.get("messageId")
+
         log(
             event="message_received",
             request_id=request_id,
-            message_id=record.get("messageId"),
+            message_id=message_id,
             receive_count=receive_count(record),
             body=truncate(record.get("body")),
         )
 
-        process(record, request_id)
+        try:
+            process(record, request_id)
+        except Exception as error:  # noqa: BLE001 - ver docstring do modulo
+            # Erro inesperado: devolver o messageId faz a SQS reentregar apenas
+            # esta mensagem. As demais do lote ja foram confirmadas e nao serao
+            # reprocessadas — e para isso que serve o ReportBatchItemFailures.
+            log(
+                event="message_failed",
+                request_id=request_id,
+                message_id=message_id,
+                receive_count=receive_count(record),
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+            failures.append({"itemIdentifier": message_id})
 
-    # Contrato ReportBatchItemFailures, declarado no event source mapping.
-    # Continua vazio neste ciclo: nada volta para a fila ainda. O Ciclo 3
-    # preenche esta lista com os messageIds que merecem nova tentativa.
-    return {"batchItemFailures": []}
+    if failures:
+        log(
+            event="batch_partial_failure",
+            request_id=request_id,
+            failed=len(failures),
+            total=len(records),
+        )
+
+    return {"batchItemFailures": failures}
 
 
 def process(record, request_id):
+    """Processa uma mensagem.
+
+    Erros permanentes sao resolvidos aqui dentro (vao para a DLQ e a mensagem e
+    confirmada). Qualquer outra excecao sobe para o lambda_handler, que a
+    transforma em retry.
+    """
     message_id = record.get("messageId")
 
     try:
         a, b, c = parse(record.get("body"))
         result = calculate(a, b, c)
     except (InvalidMessage, ValueError) as error:
-        # calculate() levanta ValueError para a = 0, valores nao finitos e
-        # coeficientes que estouram o ponto flutuante — todos permanentes,
-        # pela mesma razao que InvalidMessage: reentregar nao muda o desfecho.
-        log(
-            event="message_rejected",
-            request_id=request_id,
-            message_id=message_id,
-            reason=str(error),
-        )
+        reject(record, request_id, str(error))
         return
+
+    publish(
+        RESULTS_QUEUE_URL,
+        dict(result, message_id=message_id),
+    )
 
     log(
         event="message_processed",
@@ -97,6 +132,61 @@ def process(record, request_id):
         message_id=message_id,
         **result,
     )
+
+
+def reject(record, request_id, reason):
+    """Manda a mensagem para a DLQ com o motivo anexado.
+
+    O corpo original vai intacto: o objetivo da DLQ e permitir inspecionar e,
+    se for o caso, reprocessar exatamente o que chegou. O motivo viaja como
+    message attribute justamente para nao contaminar o payload.
+
+    Se a publicacao falhar, a excecao sobe e a mensagem vira retry — o que e
+    correto: falhar em arquivar nao pode virar perda silenciosa.
+    """
+    publish(
+        DLQ_QUEUE_URL,
+        record.get("body"),
+        attributes={
+            "RejectionReason": {"DataType": "String", "StringValue": reason[:256]},
+            "SourceMessageId": {
+                "DataType": "String",
+                "StringValue": str(record.get("messageId")),
+            },
+        },
+    )
+
+    log(
+        event="message_rejected",
+        request_id=request_id,
+        message_id=record.get("messageId"),
+        reason=reason,
+    )
+
+
+def publish(queue_url, body, attributes=None):
+    if not queue_url:
+        raise RuntimeError("Fila de destino nao configurada no ambiente da funcao.")
+
+    payload = body if isinstance(body, str) else json.dumps(body, allow_nan=False)
+
+    request = {"QueueUrl": queue_url, "MessageBody": payload}
+
+    if attributes:
+        request["MessageAttributes"] = attributes
+
+    sqs().send_message(**request)
+
+
+def sqs():
+    global _sqs
+
+    if _sqs is None:
+        import boto3
+
+        _sqs = boto3.client("sqs")
+
+    return _sqs
 
 
 def parse(body):
@@ -112,9 +202,7 @@ def parse(body):
     try:
         # parse_constant intercepta os literais NaN, Infinity e -Infinity, que
         # o json.loads aceita por padrao apesar de a RFC 8259 nao os permitir.
-        # Sem isso eles atravessariam a validacao de tipo abaixo — sao float —
-        # e so seriam barrados la dentro do calculate, com uma mensagem menos
-        # precisa sobre a origem do problema.
+        # Sem isso eles atravessariam a validacao de tipo abaixo — sao float.
         payload = json.loads(body, parse_constant=reject_constant)
     except json.JSONDecodeError as error:
         raise InvalidMessage("Corpo da mensagem nao e JSON valido: %s" % error) from None
@@ -125,9 +213,7 @@ def parse(body):
     missing = [name for name in COEFFICIENTS if name not in payload]
 
     if missing:
-        raise InvalidMessage(
-            "Coeficientes ausentes: %s." % ", ".join(missing)
-        )
+        raise InvalidMessage("Coeficientes ausentes: %s." % ", ".join(missing))
 
     return tuple(coefficient(payload[name], name) for name in COEFFICIENTS)
 
@@ -155,9 +241,9 @@ def reject_constant(name):
 def receive_count(record):
     """Quantas vezes esta mensagem ja foi entregue.
 
-    A SQS envia o valor como string. Convertido para int porque a validacao do
-    Ciclo 1 exige receive_count == 1 (consumo na primeira entrega) e, a partir
-    do Ciclo 3, e este numero que mostra o retry acontecendo.
+    A SQS envia o valor como string. E este numero que mostra o retry
+    acontecendo: 1 na primeira entrega, 2 e 3 nas seguintes, e entao a mensagem
+    vai para a DLQ pelo redrive_policy.
     """
     raw = (record.get("attributes") or {}).get("ApproximateReceiveCount")
 
@@ -178,8 +264,4 @@ def log(**fields):
     # print em vez de logging: o runtime da Lambda prefixa as linhas do logging
     # com nivel, timestamp e requestId, o que quebraria o JSON puro que o
     # CloudWatch Logs Insights consulta por campo.
-    #
-    # allow_nan=False e rede de seguranca: por padrao o json.dumps emite NaN e
-    # Infinity, que nao sao JSON valido. Se um nao finito escapar da validacao,
-    # e melhor a linha falhar alto do que gerar log que o painel nao parseia.
     print(json.dumps(fields, ensure_ascii=False, allow_nan=False))

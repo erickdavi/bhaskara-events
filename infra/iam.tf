@@ -38,8 +38,9 @@ data "aws_iam_policy_document" "worker" {
 
   # As tres acoes exigidas pelo event source mapping: ele recebe o lote,
   # apaga as mensagens confirmadas e consulta os atributos da fila para
-  # decidir como escalar. Nenhuma delas permite publicar na fila — o worker
-  # so consome. Quem publica e o producer, no Ciclo 4, com role propria.
+  # decidir como escalar. Nenhuma delas permite publicar na orders — o worker
+  # so consome dela. Quem publica ali e o producer, no Ciclo 4, com role
+  # propria.
   statement {
     sid    = "ConsumeOrdersQueue"
     effect = "Allow"
@@ -51,6 +52,21 @@ data "aws_iam_policy_document" "worker" {
     ]
 
     resources = [aws_sqs_queue.orders.arn]
+  }
+
+  # Publicar e permitido apenas nas duas filas de saida, e apenas publicar: o
+  # worker nao le nem apaga nada em results ou na DLQ. Se um dia um consumidor
+  # de results existir, ele tera role propria.
+  statement {
+    sid    = "PublishResultsAndRejections"
+    effect = "Allow"
+
+    actions = ["sqs:SendMessage"]
+
+    resources = [
+      aws_sqs_queue.results.arn,
+      aws_sqs_queue.orders_dlq.arn,
+    ]
   }
 }
 

@@ -22,6 +22,8 @@ case "${1:-}" in
 esac
 
 QUEUE_URL="$(terraform -chdir=infra output -raw orders_queue_url)"
+RESULTS_URL="$(terraform -chdir=infra output -raw results_queue_url)"
+DLQ_URL="$(terraform -chdir=infra output -raw dlq_queue_url)"
 LOG_GROUP="$(terraform -chdir=infra output -raw worker_log_group)"
 
 # Marco temporal: so interessa o que for gerado a partir daqui, e nao o log de
@@ -131,8 +133,41 @@ done <<< "$MESSAGE_IDS"
 echo "  $OK/$TOTAL com desfecho registrado"
 echo
 
-echo "=== Fila drenada? (esperado: 0 e 0) ==="
+echo "=== Fila orders drenada? (esperado: 0 e 0) ==="
 aws sqs get-queue-attributes \
   --queue-url "$QUEUE_URL" \
   --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
   --query 'Attributes' --output table
+echo
+
+# receive-message so entrega ate 10 por chamada e as mensagens voltam a ficar
+# visiveis depois do visibility timeout — nada e consumido de verdade aqui.
+echo "=== Amostra da fila results ==="
+aws sqs receive-message \
+  --queue-url "$RESULTS_URL" \
+  --max-number-of-messages 10 \
+  --wait-time-seconds 5 \
+  --query 'Messages[].Body' --output text | tr '\t' '\n' || true
+echo
+
+echo "=== Amostra da DLQ (com o motivo da recusa) ==="
+aws sqs receive-message \
+  --queue-url "$DLQ_URL" \
+  --max-number-of-messages 10 \
+  --wait-time-seconds 5 \
+  --message-attribute-names All \
+  --query 'Messages[].{corpo:Body,motivo:MessageAttributes.RejectionReason.StringValue}' \
+  --output table || true
+echo
+
+echo "=== Profundidade das filas ==="
+for pair in "orders:$QUEUE_URL" "results:$RESULTS_URL" "dlq:$DLQ_URL"; do
+  name="${pair%%:*}"
+  url="${pair#*:}"
+  depth="$(
+    aws sqs get-queue-attributes --queue-url "$url" \
+      --attribute-names ApproximateNumberOfMessages \
+      --query 'Attributes.ApproximateNumberOfMessages' --output text
+  )"
+  printf '  %-8s %s\n' "$name" "$depth"
+done

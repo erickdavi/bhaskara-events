@@ -47,6 +47,18 @@ resource "aws_lambda_function" "worker" {
   # torna qualquer reserva invalida).
   reserved_concurrent_executions = var.worker_reserved_concurrency
 
+  # As filas de destino chegam por ambiente, e nao codificadas no fonte: o
+  # mesmo pacote sobe para qualquer environment sem alteracao.
+  environment {
+    variables = {
+      # A fila inexistente do modo de demonstracao faz o send_message falhar
+      # com QueueDoesNotExist — uma falha inesperada legitima, do ponto de
+      # vista do worker, que exercita o caminho de retry.
+      RESULTS_QUEUE_URL = var.simulate_publish_failure ? "${aws_sqs_queue.results.url}-inexistente" : aws_sqs_queue.results.url
+      DLQ_QUEUE_URL     = aws_sqs_queue.orders_dlq.url
+    }
+  }
+
   # O log group precisa existir antes do primeiro invoke, senao a Lambda cria
   # um sem retencao e o proximo apply colide com ele.
   depends_on = [
