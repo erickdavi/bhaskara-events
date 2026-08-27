@@ -218,3 +218,21 @@ variable "cors_allow_origins" {
   type        = list(string)
   default     = ["*"]
 }
+
+variable "status_route_key" {
+  description = "Rota de leitura das metricas, no formato 'METODO /caminho'."
+  type        = string
+  default     = "GET /status"
+}
+
+variable "status_memory_size" {
+  description = "Memoria do status em MB. 128 basta: a funcao faz tres chamadas de API e serializa um JSON pequeno."
+  type        = number
+  default     = 128
+}
+
+variable "status_timeout" {
+  description = "Timeout do status em segundos. O caminho rapido responde em ~150 ms; 10 s cobre com folga a consulta ao CloudWatch Logs quando o painel pede eventos."
+  type        = number
+  default     = 10
+}

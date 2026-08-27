@@ -60,3 +60,27 @@ resource "aws_lambda_permission" "api_gateway" {
   # Restrito a rota exata: qualquer stage, mas so este metodo e caminho.
   source_arn = "${aws_apigatewayv2_api.this.execution_arn}/*/${local.route_method}${local.route_path}"
 }
+
+resource "aws_apigatewayv2_integration" "status" {
+  api_id = aws_apigatewayv2_api.this.id
+
+  integration_type = "AWS_PROXY"
+  integration_uri  = aws_lambda_function.status.invoke_arn
+
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "status" {
+  api_id    = aws_apigatewayv2_api.this.id
+  route_key = var.status_route_key
+  target    = "integrations/${aws_apigatewayv2_integration.status.id}"
+}
+
+resource "aws_lambda_permission" "api_gateway_status" {
+  statement_id  = "AllowInvokeFromApiGateway"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.status.function_name
+  principal     = "apigateway.amazonaws.com"
+
+  source_arn = "${aws_apigatewayv2_api.this.execution_arn}/*/${local.status_route_method}${local.status_route_path}"
+}

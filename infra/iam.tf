@@ -119,3 +119,75 @@ resource "aws_iam_role_policy" "producer" {
   role   = aws_iam_role.producer.id
   policy = data.aws_iam_policy_document.producer.json
 }
+
+# --- status -----------------------------------------------------------------
+
+resource "aws_iam_role" "status" {
+  name               = "${local.status_function_name}-role"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
+}
+
+# Papel estritamente de leitura. A funcao ve o tamanho das tres filas, espia a
+# DLQ e le os desfechos no log do worker — e nao consegue publicar, apagar nem
+# alterar coisa alguma. E o unico dos tres papeis que toca as tres filas, e
+# justamente por isso e o mais restrito no verbo.
+data "aws_iam_policy_document" "status" {
+  statement {
+    sid    = "WriteOwnLambdaLogs"
+    effect = "Allow"
+
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+
+    resources = [
+      "arn:${data.aws_partition.current.partition}:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${local.status_log_group}",
+      "arn:${data.aws_partition.current.partition}:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${local.status_log_group}:*",
+    ]
+  }
+
+  statement {
+    sid    = "ReadQueueDepths"
+    effect = "Allow"
+
+    actions = ["sqs:GetQueueAttributes"]
+
+    resources = [
+      aws_sqs_queue.orders.arn,
+      aws_sqs_queue.results.arn,
+      aws_sqs_queue.orders_dlq.arn,
+    ]
+  }
+
+  # A espiada na DLQ usa ReceiveMessage com VisibilityTimeout=0, que devolve as
+  # mensagens a visibilidade imediatamente. Note a ausencia de sqs:DeleteMessage:
+  # esta funcao consegue olhar a DLQ, nunca esvazia-la.
+  statement {
+    sid    = "PeekDeadLetterQueue"
+    effect = "Allow"
+
+    actions = ["sqs:ReceiveMessage"]
+
+    resources = [aws_sqs_queue.orders_dlq.arn]
+  }
+
+  # Leitura dos desfechos no log do worker, e apenas dele.
+  statement {
+    sid    = "ReadWorkerLogEvents"
+    effect = "Allow"
+
+    actions = ["logs:FilterLogEvents"]
+
+    resources = [
+      "arn:${data.aws_partition.current.partition}:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${local.worker_log_group}:*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "status" {
+  name   = "${local.status_function_name}-policy"
+  role   = aws_iam_role.status.id
+  policy = data.aws_iam_policy_document.status.json
+}

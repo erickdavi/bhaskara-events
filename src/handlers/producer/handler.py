@@ -26,25 +26,22 @@ resposta honesta de 700 mensagens publicadas e melhor do que um timeout, que
 deixaria o cliente sem saber quantas mensagens foram parar na fila.
 """
 
-import hmac
 import json
 import os
 import time
 
+from api_auth import authorized
 from generator import generate
 
 ORDERS_QUEUE_URL = os.environ.get("ORDERS_QUEUE_URL", "")
 
-# Chave esperada no header x-api-key.
+# Chave esperada no header x-api-key. A comparacao vive em shared/api_auth.py,
+# compartilhada com o handler de status.
 #
-# O HTTP API do API Gateway nao tem API key nativa (isso e recurso do REST API
-# v1), entao a verificacao acontece aqui. A alternativa no gateway seria um
-# Lambda authorizer — uma funcao, uma role e um log group a mais para comparar
-# duas strings.
-#
-# O que se protege e a amplificacao de custo: uma requisicao sem chave ainda
-# invoca esta funcao, mas gera ZERO mensagens. O abuso cai de 5.000 mensagens
-# para uma invocacao de ~2 ms, e o throttling do stage limita ate isso.
+# O que se protege aqui e a amplificacao de custo: uma requisicao sem chave
+# ainda invoca esta funcao, mas gera ZERO mensagens. O abuso cai de 5.000
+# mensagens para uma invocacao de ~2 ms, e o throttling do stage limita ate
+# isso.
 #
 # A chave vive numa variavel de ambiente da funcao, o que a expoe a quem tiver
 # lambda:GetFunctionConfiguration na conta. Para um laboratorio e adequado; um
@@ -74,7 +71,7 @@ class InvalidRequest(Exception):
 def lambda_handler(event, context):
     started = time.monotonic()
 
-    if not authorized(event):
+    if not authorized(event, API_KEY):
         log(event="request_unauthorized")
         return response(403, {"error": "Chave de API ausente ou invalida."})
 
@@ -120,26 +117,6 @@ def lambda_handler(event, context):
     # acontece depois e em outro lugar. O resultado do calculo nao esta nesta
     # resposta e nem poderia estar.
     return response(202, body)
-
-
-def authorized(event):
-    """Compara o header x-api-key com a chave configurada.
-
-    Falha fechada: sem API_KEY no ambiente, nenhuma requisicao passa. O
-    contrario — liberar tudo quando a configuracao some — transformaria um erro
-    de deploy em endpoint aberto sem ninguem perceber.
-
-    compare_digest em vez de "==" para que o tempo da comparacao nao revele
-    quantos caracteres iniciais da chave estao corretos.
-    """
-    if not API_KEY:
-        return False
-
-    # No payload format 2.0 do HTTP API os nomes de header chegam minusculos.
-    headers = event.get("headers") or {}
-    provided = headers.get("x-api-key") or ""
-
-    return hmac.compare_digest(provided, API_KEY)
 
 
 def parse_request(event):

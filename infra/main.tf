@@ -28,10 +28,16 @@ locals {
   producer_function_name = "${local.name_prefix}-producer"
   producer_log_group     = "/aws/lambda/${local.producer_function_name}"
 
-  # Metodo e caminho derivados de api_route_key ("POST /orders"), usados para
-  # restringir a permissao de invocacao a rota exata.
+  status_function_name = "${local.name_prefix}-status"
+  status_log_group     = "/aws/lambda/${local.status_function_name}"
+
+  # Metodo e caminho de cada rota, usados para restringir a permissao de
+  # invocacao ao par exato em vez de liberar a API inteira.
   route_method = split(" ", var.api_route_key)[0]
   route_path   = split(" ", var.api_route_key)[1]
+
+  status_route_method = split(" ", var.status_route_key)[0]
+  status_route_path   = split(" ", var.status_route_key)[1]
 
   # Codigo da aplicacao, relativo ao diretorio infra/.
   src_dir = "${path.module}/../src"

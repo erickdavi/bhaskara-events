@@ -78,3 +78,18 @@ output "generate_messages" {
   description = "Comando pronto para gerar 1.000 mensagens. A chave sai de 'terraform output -raw api_key'."
   value       = "curl -s -X POST '${trimsuffix(aws_apigatewayv2_stage.default.invoke_url, "/")}${local.route_path}' -H \"x-api-key: $(terraform -chdir=infra output -raw api_key)\" -H 'Content-Type: application/json' -d '{\"quantity\":1000}'"
 }
+
+output "status_url" {
+  description = "URL do endpoint de metricas do processamento."
+  value       = "${trimsuffix(aws_apigatewayv2_stage.default.invoke_url, "/")}${local.status_route_path}"
+}
+
+output "status_function_name" {
+  description = "Nome da funcao status."
+  value       = aws_lambda_function.status.function_name
+}
+
+output "read_status" {
+  description = "Comando pronto para consultar as metricas."
+  value       = "curl -s '${trimsuffix(aws_apigatewayv2_stage.default.invoke_url, "/")}${local.status_route_path}' -H \"x-api-key: $(terraform -chdir=infra output -raw api_key)\""
+}

@@ -31,6 +31,12 @@ data "archive_file" "producer" {
     content  = file("${local.src_dir}/handlers/producer/generator.py")
     filename = "generator.py"
   }
+
+  # Verificacao da chave de API, compartilhada com o handler de status.
+  source {
+    content  = file("${local.src_dir}/shared/api_auth.py")
+    filename = "api_auth.py"
+  }
 }
 
 resource "aws_lambda_function" "producer" {

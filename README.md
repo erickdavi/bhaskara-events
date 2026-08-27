@@ -4,12 +4,12 @@ Arquitetura orientada a eventos (event-driven) para cálculo de equações do
 segundo grau na AWS, com filas SQS, Lambdas assíncronas e infraestrutura
 declarada em Terraform.
 
-> **Estado atual: Ciclo 4 concluído — producer.**
+> **Estado atual: Ciclo 5 concluído — API de status.**
 >
-> Uma única requisição `POST /orders {"quantity": 1000}` gera mil equações na
-> fila e elas são processadas de forma assíncrona: 960 resultados na `results`,
-> 40 recusas na DLQ, fila drenada em menos de 30 s. Ainda não há API de status
-> nem painel — eles entram nos Ciclos 5 e 6.
+> `POST /orders {"quantity": 1000}` gera mil equações e `GET /status` devolve o
+> andamento em ~100 ms: quantas aguardam, quantas estão em processamento,
+> quantos sucessos, quantas falhas, um fluxo de eventos com cursor e uma
+> espiada na DLQ. Falta o painel, que entra no Ciclo 6.
 
 Este é o **Checkpoint 2** de um trabalho em duas partes. O Checkpoint 1 é uma
 API serverless síncrona (`API Gateway → Lambda → resposta HTTP`) que vive em
@@ -58,13 +58,14 @@ O que existe **hoje**, no Ciclo 4:
    x-api-key: <chave>
             │
             ▼
-   ┌───────────────────────┐
-   │  API Gateway HTTP API │  throttling 5 rps
-   └───────────┬───────────┘
-               ▼
-   ┌───────────────────────┐
-   │    Producer Lambda    │  gera equações variadas
-   └───────────┬───────────┘
+   ┌───────────────────────┐        GET /status
+   │  API Gateway HTTP API │◄───────────────────┐
+   └───────────┬───────────┘                    │
+               ▼                     ┌──────────┴──────────┐
+   ┌───────────────────────┐         │    Status Lambda    │
+   │    Producer Lambda    │         │ lê as três filas +  │
+   └───────────┬───────────┘         │  log do worker      │
+               │                     └─────────────────────┘
                │ SendMessageBatch (10 por chamada)
                ▼
     ┌───────────────┐     event source      ┌────────────────┐
@@ -95,7 +96,7 @@ O que existe **hoje**, no Ciclo 4:
 | 2 | Bhaskara event-driven: worker passa a calcular usando `calculator.py` | ✅ concluído |
 | 3 | Output e DLQ: fila `results`, DLQ, retry, tratamento de erro | ✅ concluído |
 | 4 | Producer: gerar N mensagens a partir de uma única requisição | ✅ concluído |
-| 5 | API de status: métricas do processamento | ⬜ |
+| 5 | API de status: métricas do processamento | ✅ concluído |
 | 6 | Web dashboard: disparar a carga e acompanhar visualmente | ⬜ |
 | 7 | Polimento e entrega | ⬜ |
 
@@ -111,25 +112,30 @@ bhaskara-events/
 ├── requirements.txt
 ├── src/
 │   ├── shared/
-│   │   └── calculator.py       # regra de negócio (reutilizada do Checkpoint 1)
+│   │   ├── calculator.py       # regra de negócio (reutilizada do Checkpoint 1)
+│   │   └── api_auth.py         # verificação da chave, usada pelos dois handlers HTTP
 │   └── handlers/
 │       ├── worker/
 │       │   └── handler.py      # consome a fila orders
-│       └── producer/
-│           ├── handler.py      # recebe POST /orders e publica em lotes
-│           └── generator.py    # constrói as equações
+│       ├── producer/
+│       │   ├── handler.py      # recebe POST /orders e publica em lotes
+│       │   └── generator.py    # constrói as equações
+│       └── status/
+│           └── handler.py      # responde GET /status
 ├── tests/
 │   ├── test_calculator.py         # 18 casos, herdados do Checkpoint 1
 │   ├── test_worker_handler.py     # 45 casos, contrato com a SQS, cálculo e falhas
 │   ├── test_generator.py          # 16 casos, variedade e correção das equações
-│   └── test_producer_handler.py   # 33 casos, requisição, lotes e chave de API
+│   ├── test_producer_handler.py   # 33 casos, requisição, lotes e chave de API
+│   └── test_status_handler.py     # 30 casos, contadores, cursor e espiada na DLQ
 ├── infra/                      # Terraform
 │   ├── versions.tf  main.tf  variables.tf  outputs.tf
 │   ├── sqs.tf                  # filas orders, results e DLQ
 │   ├── iam.tf                  # roles e políticas do worker e do producer
 │   ├── worker.tf               # Lambda, log group, event source mapping
 │   ├── producer.tf             # Lambda, log group, chave de API
-│   └── apigateway.tf           # HTTP API, rota POST /orders, throttling
+│   ├── status.tf               # Lambda de métricas
+│   └── apigateway.tf           # HTTP API, rotas POST /orders e GET /status
 ├── scripts/
 │   ├── send-test-message.sh    # publica direto na fila (sem passar pela API)
 │   └── generate-load.sh        # dispara carga pelo endpoint e acompanha as filas
@@ -160,7 +166,7 @@ Não precisa de credenciais AWS — os testes são todos locais.
 ```
 
 ```text
-112 passed
+142 passed
 ```
 
 Manualmente:
@@ -201,10 +207,12 @@ terraform output -raw tail_worker_logs
 | `aws_lambda_event_source_mapping` | — | batch 10, janela 0 s, `ReportBatchItemFailures` |
 | `aws_iam_role` + `aws_iam_role_policy` | `bhaskara-events-dev-worker-role` | ARN restrito, sem `Resource: "*"` |
 | `aws_lambda_function` | `bhaskara-events-dev-producer` | Python 3.13, arm64, 256 MB, timeout 30 s |
-| `aws_apigatewayv2_api` + rota + stage | `bhaskara-events-dev` | HTTP API, `POST /orders`, throttling 5 rps |
+| `aws_lambda_function` | `bhaskara-events-dev-status` | Python 3.13, arm64, 128 MB, timeout 10 s |
+| `aws_apigatewayv2_api` + rotas + stage | `bhaskara-events-dev` | HTTP API, `POST /orders` e `GET /status`, throttling 5 rps |
 | `random_password` | — | chave de API, 40 caracteres, output `sensitive` |
 | `aws_iam_role` + `aws_iam_role_policy` | `…-producer-role` | `sqs:SendMessage` apenas na `orders` |
-| `aws_cloudwatch_log_group` | `/aws/lambda/bhaskara-events-dev-{worker,producer}` | retenção 7 dias, removidos no `destroy` |
+| `aws_iam_role` + `aws_iam_role_policy` | `…-status-role` | só leitura: sem `SendMessage`, sem `DeleteMessage` |
+| `aws_cloudwatch_log_group` | `/aws/lambda/bhaskara-events-dev-{worker,producer,status}` | retenção 7 dias, removidos no `destroy` |
 
 ## Gerando carga
 
@@ -241,6 +249,33 @@ até 5.000 mensagens — e sem autenticação seria um gerador de custo para que
 encontrasse. Sem a chave, a resposta é `403` e **nenhuma mensagem é gerada**.
 Obtenha a chave com `terraform output -raw api_key`; ela nunca é versionada.
 Detalhes em [`docs/cycle-04.md`](docs/cycle-04.md).
+
+## Acompanhando o processamento
+
+```bash
+STATUS="$(terraform -chdir=infra output -raw status_url)"
+KEY="$(terraform -chdir=infra output -raw api_key)"
+
+curl -s "$STATUS" -H "x-api-key: $KEY"
+```
+
+```json
+{"queued": 347, "in_flight": 110, "succeeded": 640, "failed": 13,
+ "processed": 653, "checked_at": 1787805030643}
+```
+
+| Parâmetro | Descrição |
+| --- | --- |
+| `events=N&since=<cursor>` | até 100 desfechos posteriores ao cursor, com `events_cursor` para o próximo poll |
+| `dlq=N` | até 10 mensagens da DLQ com corpo e motivo, **sem consumi-las** |
+
+Sem parâmetros a resposta sai de três chamadas de `GetQueueAttributes` e a
+função executa em ~100 ms — rápido o bastante para o painel do Ciclo 6 fazer
+polling. Detalhes em [`docs/cycle-05.md`](docs/cycle-05.md).
+
+> `succeeded` e `failed` são contadores **acumulados**, não por execução: nada
+> consome a `results` nem a DLQ, então elas são o placar desde a última limpeza.
+> Tire uma leitura antes de disparar a carga e subtraia.
 
 ## Validando
 
